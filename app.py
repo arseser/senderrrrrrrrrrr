@@ -19,45 +19,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Используем /tmp/ для надёжности (Клод сказал)
-COOKIES_FILE = "/tmp/cookies.json"
+# Upstash Redis REST API
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+UPSTASH_HEADERS = {"Authorization": f"Bearer {UPSTASH_TOKEN}"} if UPSTASH_TOKEN else {}
+COOKIES_KEY = "olx_cookies"
+
 MAX_URLS = 20
 MAX_WORKERS = 5
 DELAY_BETWEEN = 10
 
-# Создаём файл, если нет
-if not os.path.exists(COOKIES_FILE):
-    try:
-        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f)
-        logger.info(f"Создан пустой {COOKIES_FILE}")
-    except Exception as e:
-        logger.error(f"Не могу создать {COOKIES_FILE}: {e}")
-
 def load_cookies():
+    """Загружает куки из Upstash Redis."""
+    if not UPSTASH_URL:
+        logger.warning("Upstash URL не задан, куки не сохранятся.")
+        return {}
     try:
-        with open(COOKIES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            logger.info(f"Загружено кук: {len(data)}")
-            return data
+        resp = requests.get(f"{UPSTASH_URL}/get/{COOKIES_KEY}", headers=UPSTASH_HEADERS, timeout=10)
+        result = resp.json().get("result")
+        if result:
+            return json.loads(result)
+        return {}
     except Exception as e:
-        logger.error(f"Ошибка загрузки кук: {e}")
+        logger.error(f"Ошибка загрузки кук из Upstash: {e}")
         return {}
 
 def save_cookies(data):
+    """Сохраняет куки в Upstash Redis."""
+    if not UPSTASH_URL:
+        logger.error("Upstash URL не задан, куки не сохранены.")
+        return
     try:
-        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info(f"Куки сохранены. Всего: {len(data)}")
+        payload = json.dumps(data, ensure_ascii=False)
+        resp = requests.post(
+            f"{UPSTASH_URL}/set/{COOKIES_KEY}",
+            headers=UPSTASH_HEADERS,
+            data=payload.encode("utf-8"),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        logger.info(f"Куки сохранены в Upstash. Всего: {len(data)}")
     except Exception as e:
-        logger.error(f"Ошибка сохранения кук: {e}")
-        raise
+        logger.error(f"Ошибка сохранения кук в Upstash: {e}")
 
 def cookie_str_to_dict(cookie_str: str) -> dict:
     if not cookie_str:
         return {}
     stripped = cookie_str.strip()
-    # Пробуем JSON
     if stripped.startswith("[") or stripped.startswith("{"):
         try:
             data = json.loads(stripped)
@@ -69,15 +77,12 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
                 if result:
                     return result
             elif isinstance(data, dict):
-                # Если это одиночный объект куки
                 if "name" in data and "value" in data:
                     return {data["name"]: data["value"]}
-                # Если это плоский словарь ключ-значение
                 if all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
                     return data
         except Exception:
-            logger.warning("Не удалось разобрать JSON кук, перехожу к формату key=value")
-    # Формат key=value; key2=value2
+            pass
     result = {}
     for item in stripped.split(";"):
         item = item.strip()
@@ -89,7 +94,6 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
 def extract_numeric_id(html: str, url: str = "") -> str | None:
     soup = BeautifulSoup(html, "html.parser")
 
-    # Главный источник: olx-init-config (по рекомендации Клода)
     init_config = soup.find("script", id="olx-init-config")
     if init_config and init_config.string:
         try:
@@ -112,7 +116,6 @@ def extract_numeric_id(html: str, url: str = "") -> str | None:
                 if val and str(val).isdigit():
                     logger.info(f"ID найден в olx-init-config: {val}")
                     return str(val)
-            # Резервный regex
             config_str = json.dumps(config)
             match = re.search(r'"id"\s*:\s*(\d{7,})', config_str)
             if match:
@@ -311,7 +314,7 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
 
     return result
 
-# ========== ФРОНТЕНД С ГАРАНТИРОВАННОЙ РАБОТОЙ ДОБАВЛЕНИЯ КУК ==========
+# ========== HTML ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -381,7 +384,6 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <script>
-        // Загрузка списка кук
         async function loadCookies() {
             try {
                 const resp = await fetch('/api/cookies');
@@ -400,7 +402,6 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // Добавление куки
         async function addCookie() {
             const nameInput = document.getElementById('cookieName');
             const valueInput = document.getElementById('cookieValue');
@@ -428,7 +429,7 @@ HTML_PAGE = """<!DOCTYPE html>
                     status.innerHTML = '<span class="success">Кука добавлена!</span>';
                     nameInput.value = '';
                     valueInput.value = '';
-                    loadCookies(); // обновить список
+                    loadCookies();
                 } else {
                     status.innerHTML = `<span class="error">Ошибка: ${data.error || 'Неизвестная ошибка'}</span>`;
                 }
@@ -516,7 +517,6 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // Первоначальная загрузка
         loadCookies();
     </script>
 </body>
@@ -547,7 +547,7 @@ def manage_cookies():
             cookies = load_cookies()
             cookies[name] = cookie_str
             save_cookies(cookies)
-            logger.info(f"Кука '{name}' добавлена/обновлена. Всего кук: {len(cookies)}")
+            logger.info(f"Кука '{name}' добавлена/обновлена. Всего: {len(cookies)}")
             return jsonify({"success": True})
     except Exception as e:
         logger.error(f"Ошибка в /api/cookies: {traceback.format_exc()}")
@@ -565,20 +565,25 @@ def propose_batch():
             return jsonify({"success": False, "error": "Нет ссылок"}), 400
         if len(urls) > MAX_URLS:
             return jsonify({"success": False, "error": f"Максимум {MAX_URLS} ссылок"}), 400
+
         cookies = load_cookies()
         cookie_str = cookies.get(cookie_name)
         if not cookie_str:
             return jsonify({"success": False, "error": f"Кука '{cookie_name}' не найдена"}), 404
+
         cookie_dict = cookie_str_to_dict(cookie_str)
         if not cookie_dict:
             return jsonify({"success": False, "error": "Не удалось разобрать куку"}), 400
+
         results = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(process_single_url, url, cookie_dict, DELAY_BETWEEN): url for url in urls}
             for future in as_completed(futures):
                 results.append(future.result())
+
         url_order = {url: i for i, url in enumerate(urls)}
         results.sort(key=lambda r: url_order.get(r["url"], 999))
+
         return jsonify({"success": True, "results": results})
     except Exception as e:
         logger.error(f"Ошибка в /api/propose_batch: {traceback.format_exc()}")
