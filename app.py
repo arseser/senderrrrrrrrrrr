@@ -42,14 +42,15 @@ def save_cookies(data):
 
 def cookie_str_to_dict(cookie_str: str) -> dict:
     """
-    Принимает строку кук в двух форматах:
-    1. Обычный: "key1=val1; key2=val2; ..."
-    2. JSON-массив: [{"name": "...", "value": "..."}, ...]
+    Принимает:
+    1. Строку "key=val; key2=val2"
+    2. JSON-массив [{"name":"x","value":"y"}, ...]
     Возвращает словарь {name: value}
     """
     if not cookie_str:
         return {}
     stripped = cookie_str.strip()
+    # JSON-формат
     if stripped.startswith("[") or stripped.startswith("{"):
         try:
             data = json.loads(stripped)
@@ -65,6 +66,7 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
                 return data
         except Exception:
             pass
+    # Обычная строка
     result = {}
     for item in cookie_str.split(";"):
         item = item.strip()
@@ -98,12 +100,69 @@ def extract_price(html: str) -> int | None:
         return None
 
 def extract_csrf(html: str, session_obj: requests.Session) -> str | None:
+    """
+    Ищет CSRF-токен во всех возможных местах:
+    1. Мета-теги (name="csrf-token", property, etc)
+    2. Скрытые input'ы
+    3. JS-переменные
+    4. Куки сессии
+    """
     try:
         soup = BeautifulSoup(html, "html.parser")
+
+        # 1. meta[name="csrf-token"]
         meta = soup.find("meta", attrs={"name": "csrf-token"})
         if meta and meta.get("content"):
-            return meta["content"]
-        return session_obj.cookies.get("csrftoken") or session_obj.cookies.get("csrf")
+            return meta["content"].strip()
+
+        # 2. meta[name="_csrf"] или [name="csrf"]
+        for attr_name in ("_csrf", "csrf"):
+            meta = soup.find("meta", attrs={"name": attr_name})
+            if meta and meta.get("content"):
+                return meta["content"].strip()
+
+        # 3. meta[property="csrf-token"]
+        meta = soup.find("meta", attrs={"property": "csrf-token"})
+        if meta and meta.get("content"):
+            return meta["content"].strip()
+
+        # 4. input[type="hidden"] с именем, содержащим csrf
+        for input_tag in soup.find_all("input", type="hidden"):
+            name = input_tag.get("name", "").lower()
+            value = input_tag.get("value", "")
+            if "csrf" in name and value:
+                return value.strip()
+
+        # 5. Ищем в тексте страницы JS-переменные:
+        #    window.CSRF_TOKEN = '...'   или  csrfToken = "..."
+        js_patterns = [
+            r'window\.CSRF_TOKEN\s*=\s*["\']([^"\']+)["\']',
+            r'csrfToken\s*=\s*["\']([^"\']+)["\']',
+            r'__csrf\s*=\s*["\']([^"\']+)["\']',
+            r'"_csrf"\s*:\s*"([^"]+)"',   # JSON-вставка
+        ]
+        for pat in js_patterns:
+            match = re.search(pat, html)
+            if match:
+                return match.group(1).strip()
+
+        # 6. data-атрибуты на body или html
+        for tag in soup.find_all(attrs={"data-csrf": True}):
+            return tag["data-csrf"].strip()
+        body = soup.find("body")
+        if body and body.get("data-csrf-token"):
+            return body["data-csrf-token"].strip()
+
+        # 7. Куки сессии (csrftoken, XSRF-TOKEN, _csrf)
+        for cookie_name in ("csrftoken", "XSRF-TOKEN", "_csrf", "csrf"):
+            val = session_obj.cookies.get(cookie_name)
+            if val:
+                return val
+
+        # 8. Заголовки ответа? (маловероятно, но вдруг)
+        # Не можем получить из response после первого GET, поэтому пропускаем.
+
+        return None
     except Exception as e:
         logger.error(f"Ошибка извлечения CSRF: {e}")
         return None
@@ -133,22 +192,19 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка загрузки страницы: {e}"}
 
-    # ========== ПОИСК OFFER_ID (ПОДДЕРЖИВАЕТ ВСЕ ФОРМАТЫ) ==========
+    # ========== ПОИСК OFFER_ID (все форматы) ==========
     offer_id = None
 
-    # 1. Из URL: ...-IDxxxxx.html или ..._IDxxxxx.html (CID757-ID1aP2C1.html -> 1aP2C1)
     match = re.search(r'/[^/]*[_-][iI][dD](\w+)\.html', url)
     if match:
         offer_id = match.group(1)
     else:
-        # 2. Числовой ID в конце URL (например, /oferta/123456789)
         match = re.search(r'/(\d{7,})(?:\.html)?$', url)
         if match:
             offer_id = match.group(1)
 
     if not offer_id:
         soup = BeautifulSoup(html, "html.parser")
-        # 3. Из og:url
         meta_og = soup.find("meta", property="og:url")
         if meta_og and meta_og.get("content"):
             og_url = meta_og.get("content", "")
@@ -160,37 +216,30 @@ def propose_price(url: str, cookie_str: str) -> dict:
                 if match:
                     offer_id = match.group(1)
 
-        # 4. data-cy="ad.id"
         if not offer_id:
             elem = soup.find(attrs={"data-cy": "ad.id"})
             if elem:
                 offer_id = elem.text.strip()
-        # 5. meta itemprop="productID"
         if not offer_id:
             meta_product = soup.find("meta", itemprop="productID")
             if meta_product and meta_product.get("content"):
                 offer_id = meta_product["content"].strip()
-        # 6. input#offer_id
         if not offer_id:
             tag = soup.find(id="offer_id")
             if tag and tag.get("value"):
                 offer_id = tag["value"]
-        # 7. data-offerid
         if not offer_id:
             elem = soup.find(attrs={"data-offerid": True})
             if elem:
                 offer_id = elem["data-offerid"]
-        # 8. JS: ad_id: 123456
         if not offer_id:
             match = re.search(r'"ad_id"\s*:\s*"?(\d+)"?', html)
             if match:
                 offer_id = match.group(1)
-        # 9. adId
         if not offer_id:
             match = re.search(r'"adId"\s*:\s*"?(\d+)"?', html)
             if match:
                 offer_id = match.group(1)
-        # 10. Последняя надежда: любое число 7+ цифр в URL
         if not offer_id:
             match = re.search(r'/(\d{7,})', url)
             if match:
@@ -199,7 +248,7 @@ def propose_price(url: str, cookie_str: str) -> dict:
     if not offer_id:
         return {"success": False, "error": "Не удалось извлечь ID объявления. Проверьте ссылку."}
 
-    # ========== ДАЛЕЕ БЕЗ ИЗМЕНЕНИЙ ==========
+    # ========== ЦЕНА И ПРЕДЛОЖЕНИЕ ==========
     original_price = extract_price(html)
     if original_price is None:
         return {"success": False, "error": "Не удалось определить цену на странице"}
@@ -214,7 +263,7 @@ def propose_price(url: str, cookie_str: str) -> dict:
 
     csrf_token = extract_csrf(html, session)
     if not csrf_token:
-        return {"success": False, "error": "Не удалось получить CSRF-токен"}
+        return {"success": False, "error": "Не удалось получить CSRF-токен. Убедитесь, что в куках есть 'csrftoken'."}
 
     api_url = f"https://www.olx.pl/api/v1/offers/{offer_id}/propose-price/"
     payload = {"price": str(proposal)}
@@ -242,7 +291,7 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка отправки предложения: {e}"}
 
-# ========== HTML-страница ==========
+# ========== HTML ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
