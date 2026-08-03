@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 COOKIES_FILE = "cookies.json"
 MAX_URLS = 20
 MAX_WORKERS = 5
-DELAY_BETWEEN = 10  # секунд между отправками
+DELAY_BETWEEN = 10
 
 if not os.path.exists(COOKIES_FILE):
     with open(COOKIES_FILE, "w", encoding="utf-8") as f:
@@ -73,84 +73,71 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
             result[k.strip()] = v.strip()
     return result
 
-def extract_numeric_id(html: str) -> str | None:
+def extract_numeric_id(html: str, url: str = "") -> str | None:
     """
-    Извлекает числовой ID объявления.
-    Перебирает все известные источники, логирует каждый шаг.
+    Извлекает числовой ID объявления. Логирует каждый шаг.
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. Мета-тег al:android:url (самый надёжный по рекомендации Клода)
+    # 1. al:android:url
     meta = soup.find("meta", property="al:android:url")
     if meta and meta.get("content"):
         match = re.search(r'item/(\d+)', meta["content"])
         if match:
-            logger.info(f"ID найден в al:android:url: {match.group(1)}")
+            logger.info(f"[ID] Найден в al:android:url: {match.group(1)}")
             return match.group(1)
 
-    # 2. Мета-тег og:url с -ID123456.html
+    # 2. og:url (редко содержит число, но вдруг)
     meta = soup.find("meta", property="og:url")
     if meta and meta.get("content"):
-        # Ищем -ID<число>.html или ID<число>.html
         match = re.search(r'-ID(\d+)\.html', meta["content"])
         if match:
-            logger.info(f"ID найден в og:url: {match.group(1)}")
+            logger.info(f"[ID] Найден в og:url: {match.group(1)}")
             return match.group(1)
 
-    # 3. Поиск в скриптах: __PRERENDERED_STATE__ или __INITIAL_STATE__
+    # 3. Из URL (если передали, иногда в конце есть число)
+    if url:
+        match = re.search(r'/(\d{7,})(?:\.html|$)', url)
+        if match:
+            logger.info(f"[ID] Найден в URL: {match.group(1)}")
+            return match.group(1)
+
+    # 4. JS-объекты
     for script in soup.find_all("script"):
         if script.string:
-            # adId (как число)
-            match = re.search(r'"adId"\s*:\s*"?(\d+)"?', script.string)
-            if match:
-                logger.info(f"ID найден в JS adId: {match.group(1)}")
-                return match.group(1)
-            # ad_id
-            match = re.search(r'"ad_id"\s*:\s*"?(\d+)"?', script.string)
-            if match:
-                logger.info(f"ID найден в JS ad_id: {match.group(1)}")
-                return match.group(1)
-            # "id": 12345678 (в контексте объявления)
-            match = re.search(r'"id"\s*:\s*(\d{7,})', script.string)
-            if match:
-                logger.info(f"ID найден в JS id: {match.group(1)}")
-                return match.group(1)
+            for pattern in [r'"adId"\s*:\s*"?(\d+)"?', r'"ad_id"\s*:\s*"?(\d+)"?', r'"offerId"\s*:\s*"?(\d+)"?', r'"id"\s*:\s*(\d{7,})']:
+                match = re.search(pattern, script.string)
+                if match:
+                    logger.info(f"[ID] Найден в JS ({pattern}): {match.group(1)}")
+                    return match.group(1)
 
-    # 4. JSON-LD (structured data)
+    # 5. JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
         if script.string:
             try:
                 data = json.loads(script.string)
                 if isinstance(data, dict):
-                    # Может быть "@id" или "productID"
-                    for key in ("@id", "productID", "sku"):
+                    for key in ("productID", "sku", "@id"):
                         if key in data and str(data[key]).isdigit():
-                            logger.info(f"ID найден в JSON-LD {key}: {data[key]}")
+                            logger.info(f"[ID] Найден в JSON-LD {key}: {data[key]}")
                             return str(data[key])
             except Exception:
                 pass
 
-    # 5. data-offerid на body или основном div
+    # 6. data-offerid
     body = soup.find("body")
     if body and body.get("data-offerid"):
         val = body["data-offerid"]
         if val.isdigit():
-            logger.info(f"ID найден в data-offerid: {val}")
+            logger.info(f"[ID] Найден в data-offerid: {val}")
             return val
 
-    # 6. Скрытые поля input[name="offerId"] или подобные
+    # 7. Скрытые инпуты
     for inp in soup.find_all("input", type="hidden"):
-        if inp.get("name") in ("offerId", "adId", "id") and inp.get("value", "").isdigit():
-            logger.info(f"ID найден в hidden input {inp['name']}: {inp['value']}")
+        name = (inp.get("name") or "").lower()
+        if name in ("offerid", "adid", "id") and inp.get("value", "").isdigit():
+            logger.info(f"[ID] Найден в hidden input {name}: {inp['value']}")
             return inp["value"]
-
-    # 7. Поиск в произвольных JS-объектах: offerId, adId, ad_id
-    # Уже покрыто выше, но добавим запасной regex по всему HTML
-    for pattern in (r'"adId"\s*:\s*"?(\d+)"?', r'"ad_id"\s*:\s*"?(\d+)"?', r'"offerId"\s*:\s*"?(\d+)"?'):
-        match = re.search(pattern, html)
-        if match:
-            logger.info(f"ID найден в HTML regex {pattern}: {match.group(1)}")
-            return match.group(1)
 
     return None
 
@@ -178,8 +165,55 @@ def extract_price(html: str) -> int | None:
         logger.error(f"Ошибка парсинга цены: {e}")
         return None
 
+def check_negotiation_possible(html: str) -> bool:
+    """Проверяет, есть ли на странице флаг allow_negotiation или кнопка 'Предложить цену'."""
+    # Ищем в JS-данных
+    match = re.search(r'"allowNegotiation"\s*:\s*true', html)
+    if match:
+        return True
+    # Ищем кнопку по тексту
+    soup = BeautifulSoup(html, "html.parser")
+    for button in soup.find_all(["button", "a"]):
+        text = button.get_text(strip=True).lower()
+        if "предложить цену" in text or "propose price" in text:
+            return True
+    return False
+
+def send_price_proposal(session, numeric_id, proposal, url, cookie_dict):
+    """Пытается отправить предложение. Возвращает (success, error_message)."""
+    # Пробуем несколько эндпоинтов
+    endpoints = [
+        f"https://www.olx.pl/api/v1/offers/{numeric_id}/propose-price/",
+        f"https://www.olx.pl/api/v1/offers/{numeric_id}/propose/",
+    ]
+    headers = session.headers.copy()
+    headers.update({"Content-Type": "application/json"})
+
+    # XSRF-токен
+    xsrf_token = session.cookies.get("XSRF-TOKEN", domain=".olx.pl")
+    if xsrf_token:
+        xsrf_token = urllib.parse.unquote(xsrf_token)
+        headers["X-XSRF-TOKEN"] = xsrf_token
+
+    access_token = cookie_dict.get("access_token")
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+
+    payload = {"price": int(proposal), "currency": "PLN"}
+
+    for endpoint in endpoints:
+        try:
+            resp = session.post(endpoint, json=payload, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                return True, None
+            else:
+                logger.warning(f"Эндпоинт {endpoint} вернул {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logger.error(f"Ошибка при запросе к {endpoint}: {e}")
+    # Если оба не сработали
+    return False, "Все эндпоинты вернули ошибку. Проверьте, поддерживает ли объявление торг."
+
 def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) -> dict:
-    """Обрабатывает одну ссылку с задержкой перед отправкой."""
     result = {"url": url}
 
     session = requests.Session()
@@ -192,37 +226,40 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
         return result
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Origin": "https://www.olx.pl",
-        "Referer": url,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pl-PL,pl;q=0.9",
     }
     session.headers.update(headers)
 
-    # Загружаем страницу
     try:
         resp = session.get(url, timeout=15)
         resp.raise_for_status()
         html = resp.text
     except Exception as e:
         result["success"] = False
-        result["error"] = f"Ошибка загрузки: {e}"
+        result["error"] = f"Ошибка загрузки страницы: {e}"
         return result
 
-    # Извлекаем числовой ID
-    numeric_id = extract_numeric_id(html)
+    # ID
+    numeric_id = extract_numeric_id(html, url)
     if not numeric_id:
         result["success"] = False
-        result["error"] = "Не найден числовой ID"
+        result["error"] = "Не удалось найти числовой ID объявления. Возможно, ссылка неверна или страница изменилась."
         return result
-    logger.info(f"Числовой ID объявления: {numeric_id}")
+    result["numeric_id"] = numeric_id  # для отладки
 
-    # Оригинальная цена
+    # Проверка возможности торга
+    if not check_negotiation_possible(html):
+        result["success"] = False
+        result["error"] = "Объявление не поддерживает предложение цены (нет кнопки или флага)."
+        return result
+
+    # Цена
     original_price = extract_price(html)
     if original_price is None:
         result["success"] = False
-        result["error"] = "Не удалось определить цену"
+        result["error"] = "Не удалось определить цену на странице."
         return result
 
     # Вычисление предложения
@@ -234,44 +271,24 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
         proposal = original_price - 20
     proposal = max(proposal, 1)
 
-    # Задержка перед отправкой
-    logger.info(f"Ожидание {delay} сек перед отправкой для {url}")
+    logger.info(f"[{url}] Найден ID={numeric_id}, цена={original_price}, предложение={proposal}")
+
+    # Задержка
     time.sleep(delay)
 
-    # XSRF-TOKEN
-    xsrf_token = session.cookies.get("XSRF-TOKEN", domain=".olx.pl")
-    if xsrf_token:
-        xsrf_token = urllib.parse.unquote(xsrf_token)
-        session.headers.update({"X-XSRF-TOKEN": xsrf_token})
-
-    # Bearer token
-    access_token = cookie_dict.get("access_token")
-    if access_token:
-        session.headers.update({"Authorization": f"Bearer {access_token}"})
-
-    # Отправка предложения
-    api_url = f"https://www.olx.pl/api/v1/offers/{numeric_id}/propose-price/"
-    payload = {"price": int(proposal), "currency": "PLN"}
-    session.headers.update({"Content-Type": "application/json"})
-
-    try:
-        api_resp = session.post(api_url, json=payload, timeout=15)
-        if api_resp.status_code == 200:
-            result["success"] = True
-            result["original_price"] = original_price
-            result["proposed_price"] = proposal
-            result["numeric_id"] = numeric_id
-        else:
-            err_text = api_resp.text[:200]
-            result["success"] = False
-            result["error"] = f"API {api_resp.status_code}: {err_text}"
-    except Exception as e:
+    # Отправка
+    success, error_msg = send_price_proposal(session, numeric_id, proposal, url, cookie_dict)
+    if success:
+        result["success"] = True
+        result["original_price"] = original_price
+        result["proposed_price"] = proposal
+    else:
         result["success"] = False
-        result["error"] = f"Ошибка отправки: {e}"
+        result["error"] = error_msg
 
     return result
 
-# ========== HTML-страница ==========
+# ========== HTML (без изменений) ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -293,34 +310,26 @@ HTML_PAGE = """<!DOCTYPE html>
         .hint { font-size: 12px; color: #888; margin-top: 4px; }
 
         .modal-overlay {
-            display: none;
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.6); z-index: 1000;
-            justify-content: center; align-items: center;
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.6); z-index: 1000; justify-content: center; align-items: center;
         }
         .modal-overlay.active { display: flex; }
         .modal {
-            background: white; border-radius: 12px; padding: 30px;
-            width: 90%; max-width: 700px; max-height: 80vh;
-            display: flex; flex-direction: column;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+            background: white; border-radius: 12px; padding: 30px; width: 90%; max-width: 700px; max-height: 80vh;
+            display: flex; flex-direction: column; box-shadow: 0 10px 40px rgba(0,0,0,0.3);
         }
         .modal h2 { margin-bottom: 15px; color: #2c3e50; }
-        .modal-results {
-            overflow-y: auto; flex: 1; margin-bottom: 15px;
-            display: flex; flex-direction: column; gap: 10px;
-        }
+        .modal-results { overflow-y: auto; flex: 1; margin-bottom: 15px; display: flex; flex-direction: column; gap: 10px; }
         .result-card {
-            border: 1px solid #ddd; border-radius: 8px; padding: 12px 15px;
-            font-size: 13px; line-height: 1.5;
+            border: 1px solid #ddd; border-radius: 8px; padding: 12px 15px; font-size: 13px; line-height: 1.5;
         }
         .result-card.success { border-left: 4px solid #27ae60; background: #f0faf4; }
         .result-card.error { border-left: 4px solid #e74c3c; background: #fef5f5; }
         .result-card .url { font-size: 11px; color: #666; word-break: break-all; margin-bottom: 5px; }
         .result-card .price { font-weight: bold; }
         .modal-close {
-            padding: 10px 20px; background: #3498db; color: white; border: none;
-            border-radius: 6px; cursor: pointer; font-size: 14px; align-self: flex-end;
+            padding: 10px 20px; background: #3498db; color: white; border: none; border-radius: 6px;
+            cursor: pointer; font-size: 14px; align-self: flex-end;
         }
         .modal-close:hover { background: #2980b9; }
 
@@ -436,7 +445,7 @@ HTML_PAGE = """<!DOCTYPE html>
             modalResults.innerHTML = urls.map((url, i) => 
                 `<div class="result-card" id="card-${i}">
                     <div class="url">${url}</div>
-                    <div>⏳ Ожидание (задержка 10 сек)...</div>
+                    <div>⏳ Ожидание...</div>
                 </div>`
             ).join('');
             modalOverlay.classList.add('active');
@@ -467,6 +476,7 @@ HTML_PAGE = """<!DOCTYPE html>
                             card.innerHTML = `
                                 <div class="url">🔗 ${r.url}</div>
                                 <div>❌ ${r.error}</div>
+                                ${r.numeric_id ? `<div>🆔 Найденный ID: ${r.numeric_id}</div>` : ''}
                             `;
                         }
                     });
@@ -538,7 +548,6 @@ def propose_batch():
             for future in as_completed(futures):
                 results.append(future.result())
 
-        # Восстанавливаем порядок
         url_order = {url: i for i, url in enumerate(urls)}
         results.sort(key=lambda r: url_order.get(r["url"], 999))
 
