@@ -42,9 +42,9 @@ def save_cookies(data):
 
 def cookie_str_to_dict(cookie_str: str) -> dict:
     """
-    Принимает:
-    1. Строку "key=val; key2=val2"
-    2. JSON-массив [{"name":"x","value":"y"}, ...]
+    Принимает строку кук в двух форматах:
+    1. Обычный: "key1=val1; key2=val2; ..."
+    2. JSON-массив: [{"name": "...", "value": "..."}, ...]
     Возвращает словарь {name: value}
     """
     if not cookie_str:
@@ -66,7 +66,7 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
                 return data
         except Exception:
             pass
-    # Обычная строка
+    # Обычная строка "key=val; key=val"
     result = {}
     for item in cookie_str.split(";"):
         item = item.strip()
@@ -101,11 +101,7 @@ def extract_price(html: str) -> int | None:
 
 def extract_csrf(html: str, session_obj: requests.Session) -> str | None:
     """
-    Ищет CSRF-токен во всех возможных местах:
-    1. Мета-теги (name="csrf-token", property, etc)
-    2. Скрытые input'ы
-    3. JS-переменные
-    4. Куки сессии
+    Ищет CSRF-токен. Если не находит, возвращает None – это допустимо.
     """
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -133,20 +129,19 @@ def extract_csrf(html: str, session_obj: requests.Session) -> str | None:
             if "csrf" in name and value:
                 return value.strip()
 
-        # 5. Ищем в тексте страницы JS-переменные:
-        #    window.CSRF_TOKEN = '...'   или  csrfToken = "..."
+        # 5. JS-переменные
         js_patterns = [
             r'window\.CSRF_TOKEN\s*=\s*["\']([^"\']+)["\']',
             r'csrfToken\s*=\s*["\']([^"\']+)["\']',
             r'__csrf\s*=\s*["\']([^"\']+)["\']',
-            r'"_csrf"\s*:\s*"([^"]+)"',   # JSON-вставка
+            r'"_csrf"\s*:\s*"([^"]+)"',
         ]
         for pat in js_patterns:
             match = re.search(pat, html)
             if match:
                 return match.group(1).strip()
 
-        # 6. data-атрибуты на body или html
+        # 6. data-атрибуты
         for tag in soup.find_all(attrs={"data-csrf": True}):
             return tag["data-csrf"].strip()
         body = soup.find("body")
@@ -159,10 +154,7 @@ def extract_csrf(html: str, session_obj: requests.Session) -> str | None:
             if val:
                 return val
 
-        # 8. Заголовки ответа? (маловероятно, но вдруг)
-        # Не можем получить из response после первого GET, поэтому пропускаем.
-
-        return None
+        return None  # Не найден – не ошибка
     except Exception as e:
         logger.error(f"Ошибка извлечения CSRF: {e}")
         return None
@@ -192,7 +184,7 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка загрузки страницы: {e}"}
 
-    # ========== ПОИСК OFFER_ID (все форматы) ==========
+    # ========== ПОИСК OFFER_ID ==========
     offer_id = None
 
     match = re.search(r'/[^/]*[_-][iI][dD](\w+)\.html', url)
@@ -261,20 +253,20 @@ def propose_price(url: str, cookie_str: str) -> dict:
         proposal = original_price - 20
     proposal = max(proposal, 1)
 
+    # CSRF-токен не обязателен
     csrf_token = extract_csrf(html, session)
-    if not csrf_token:
-        return {"success": False, "error": "Не удалось получить CSRF-токен. Убедитесь, что в куках есть 'csrftoken'."}
 
     api_url = f"https://www.olx.pl/api/v1/offers/{offer_id}/propose-price/"
     payload = {"price": str(proposal)}
     api_headers = {
         **headers,
         "Content-Type": "application/json",
-        "X-CSRF-Token": csrf_token,
         "Referer": url,
         "Origin": "https://www.olx.pl",
         "X-Requested-With": "XMLHttpRequest",
     }
+    if csrf_token:
+        api_headers["X-CSRF-Token"] = csrf_token
 
     try:
         api_resp = session.post(api_url, json=payload, headers=api_headers, timeout=15)
@@ -291,7 +283,7 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка отправки предложения: {e}"}
 
-# ========== HTML ==========
+# ========== HTML-страница ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
