@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
-# Настройка логирования – всё пишется в stdout, видно в логах Render
+# Логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -19,16 +19,19 @@ logger = logging.getLogger(__name__)
 
 COOKIES_FILE = "cookies.json"
 
-# ===== Работа с JSON-хранилищем кук =====
+# При запуске создаём файл кук, если его нет
+if not os.path.exists(COOKIES_FILE):
+    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    logger.info("Создан пустой cookies.json")
+
 def load_cookies():
-    if os.path.exists(COOKIES_FILE):
-        try:
-            with open(COOKIES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Ошибка загрузки cookies.json: {e}")
-            return {}
-    return {}
+    try:
+        with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Ошибка загрузки cookies.json: {e}")
+        return {}
 
 def save_cookies(data):
     try:
@@ -37,10 +40,9 @@ def save_cookies(data):
         logger.info("Куки сохранены")
     except Exception as e:
         logger.error(f"Ошибка сохранения cookies.json: {e}")
+        raise
 
-# ===== Парсинг кук =====
 def cookie_str_to_dict(cookie_str: str) -> dict:
-    """Преобразует строку кук 'key=val; key2=val2' в словарь"""
     result = {}
     for item in cookie_str.split(";"):
         item = item.strip()
@@ -49,23 +51,19 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
             result[k.strip()] = v.strip()
     return result
 
-# ===== Извлечение данных из страницы OLX =====
 def extract_price(html: str) -> int | None:
     try:
         soup = BeautifulSoup(html, "html.parser")
-        # Способ 1: data-testid
         elem = soup.find(attrs={"data-testid": "ad-price"})
         if elem:
             text = elem.get_text(strip=True)
         else:
-            # Способ 2: ищем <h3> с "zł"
             text = None
             for h3 in soup.find_all("h3"):
                 if "zł" in h3.get_text():
                     text = h3.get_text(strip=True)
                     break
             if not text:
-                # Способ 3: мета-тег
                 meta = soup.find("meta", property="product:price:amount")
                 if meta and meta.get("content"):
                     text = meta["content"]
@@ -83,21 +81,12 @@ def extract_csrf(html: str, session_obj: requests.Session) -> str | None:
         meta = soup.find("meta", attrs={"name": "csrf-token"})
         if meta and meta.get("content"):
             return meta["content"]
-        # Запасной вариант – из кук сессии
         return session_obj.cookies.get("csrftoken") or session_obj.cookies.get("csrf")
     except Exception as e:
         logger.error(f"Ошибка извлечения CSRF: {e}")
         return None
 
-# ===== Главная логика предложения цены =====
 def propose_price(url: str, cookie_str: str) -> dict:
-    """
-    Возвращает словарь с ключами:
-    - success: bool
-    - original_price: int (если успех)
-    - proposed_price: int (если успех)
-    - error: str (если ошибка)
-    """
     if not cookie_str:
         return {"success": False, "error": "Кука не задана"}
 
@@ -115,16 +104,13 @@ def propose_price(url: str, cookie_str: str) -> dict:
         "Accept-Language": "pl-PL,pl;q=0.9",
     }
 
-    # GET страницы
     try:
         resp = session.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         html = resp.text
     except Exception as e:
-        logger.error(f"Ошибка загрузки страницы: {e}")
         return {"success": False, "error": f"Ошибка загрузки страницы: {e}"}
 
-    # ID объявления
     offer_id = None
     match = re.search(r"-ID-(\w+)\.html", url)
     if match:
@@ -144,12 +130,10 @@ def propose_price(url: str, cookie_str: str) -> dict:
     if not offer_id:
         return {"success": False, "error": "Не удалось извлечь ID объявления"}
 
-    # Оригинальная цена
     original_price = extract_price(html)
     if original_price is None:
         return {"success": False, "error": "Не удалось определить цену на странице"}
 
-    # Вычисление предложенной цены
     if original_price <= 300:
         proposal = original_price - 5
     elif original_price <= 1000:
@@ -158,12 +142,10 @@ def propose_price(url: str, cookie_str: str) -> dict:
         proposal = original_price - 20
     proposal = max(proposal, 1)
 
-    # CSRF токен
     csrf_token = extract_csrf(html, session)
     if not csrf_token:
         return {"success": False, "error": "Не удалось получить CSRF-токен"}
 
-    # Отправка API запроса
     api_url = f"https://www.olx.pl/api/v1/offers/{offer_id}/propose-price/"
     payload = {"price": str(proposal)}
     api_headers = {
@@ -186,31 +168,27 @@ def propose_price(url: str, cookie_str: str) -> dict:
             }
         else:
             err_text = api_resp.text[:200]
-            logger.warning(f"OLX API вернул {api_resp.status_code}: {err_text}")
             return {"success": False, "error": f"Ошибка API (код {api_resp.status_code}): {err_text}"}
     except Exception as e:
-        logger.error(f"Ошибка отправки предложения: {e}")
-        return {"success": False, "error": f"Ошибка отправки: {e}"}
+        return {"success": False, "error": f"Ошибка отправки предложения: {e}"}
 
 # ========== Маршруты ==========
 
 @app.route("/")
 def index():
-    """Главная страница с интерфейсом"""
     return render_template("index.html")
 
 @app.route("/health")
 def health():
-    """Проверка работоспособности (удобно для пинга)"""
     return jsonify({"status": "ok"})
 
 @app.route("/api/cookies", methods=["GET", "POST"])
 def manage_cookies():
-    if request.method == "GET":
-        cookies = load_cookies()
-        return jsonify(list(cookies.keys()))
-    if request.method == "POST":
-        try:
+    try:
+        if request.method == "GET":
+            cookies = load_cookies()
+            return jsonify(list(cookies.keys()))
+        if request.method == "POST":
             data = request.get_json(force=True)
             name = data.get("name", "").strip()
             cookie_str = data.get("cookie", "").strip()
@@ -220,9 +198,11 @@ def manage_cookies():
             cookies[name] = cookie_str
             save_cookies(cookies)
             return jsonify({"success": True})
-        except Exception as e:
-            logger.error(f"Ошибка в /api/cookies POST: {e}")
-            return jsonify({"success": False, "error": "Внутренняя ошибка сервера"}), 500
+    except Exception as e:
+        # ВАЖНО: выводим полный трейсбек
+        err = traceback.format_exc()
+        logger.error(err)
+        return jsonify({"success": False, "error": f"Исключение: {err}"}), 500
 
 @app.route("/api/propose", methods=["POST"])
 def propose():
@@ -241,13 +221,14 @@ def propose():
         result = propose_price(url, cookie_str)
         return jsonify(result)
     except Exception as e:
-        logger.error(f"Критическая ошибка в /api/propose: {traceback.format_exc()}")
-        return jsonify({"success": False, "error": f"Внутренняя ошибка сервера: {e}"}), 500
+        err = traceback.format_exc()
+        logger.error(err)
+        return jsonify({"success": False, "error": f"Исключение: {err}"}), 500
 
 @app.errorhandler(500)
 def handle_500(e):
     logger.error(f"Unhandled 500 error: {e}")
-    return jsonify({"success": False, "error": "Внутренняя ошибка сервера"}), 500
+    return jsonify({"success": False, "error": f"Unhandled: {traceback.format_exc()}"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
