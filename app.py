@@ -74,69 +74,41 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
     return result
 
 def extract_numeric_id(html: str, url: str = "") -> str | None:
-    """
-    Извлекает числовой ID объявления. Логирует каждый шаг.
-    """
     soup = BeautifulSoup(html, "html.parser")
-
-    # 1. al:android:url
     meta = soup.find("meta", property="al:android:url")
     if meta and meta.get("content"):
         match = re.search(r'item/(\d+)', meta["content"])
         if match:
-            logger.info(f"[ID] Найден в al:android:url: {match.group(1)}")
+            logger.info(f"ID найден в al:android:url: {match.group(1)}")
             return match.group(1)
 
-    # 2. og:url (редко содержит число, но вдруг)
     meta = soup.find("meta", property="og:url")
     if meta and meta.get("content"):
         match = re.search(r'-ID(\d+)\.html', meta["content"])
         if match:
-            logger.info(f"[ID] Найден в og:url: {match.group(1)}")
+            logger.info(f"ID найден в og:url: {match.group(1)}")
             return match.group(1)
 
-    # 3. Из URL (если передали, иногда в конце есть число)
     if url:
         match = re.search(r'/(\d{7,})(?:\.html|$)', url)
         if match:
-            logger.info(f"[ID] Найден в URL: {match.group(1)}")
+            logger.info(f"ID найден в URL: {match.group(1)}")
             return match.group(1)
 
-    # 4. JS-объекты
     for script in soup.find_all("script"):
         if script.string:
-            for pattern in [r'"adId"\s*:\s*"?(\d+)"?', r'"ad_id"\s*:\s*"?(\d+)"?', r'"offerId"\s*:\s*"?(\d+)"?', r'"id"\s*:\s*(\d{7,})']:
+            for pattern in [r'"adId"\s*:\s*"?(\d+)"?', r'"ad_id"\s*:\s*"?(\d+)"?', r'"offerId"\s*:\s*"?(\d+)"?']:
                 match = re.search(pattern, script.string)
                 if match:
-                    logger.info(f"[ID] Найден в JS ({pattern}): {match.group(1)}")
+                    logger.info(f"ID найден в JS: {match.group(1)}")
                     return match.group(1)
 
-    # 5. JSON-LD
-    for script in soup.find_all("script", type="application/ld+json"):
-        if script.string:
-            try:
-                data = json.loads(script.string)
-                if isinstance(data, dict):
-                    for key in ("productID", "sku", "@id"):
-                        if key in data and str(data[key]).isdigit():
-                            logger.info(f"[ID] Найден в JSON-LD {key}: {data[key]}")
-                            return str(data[key])
-            except Exception:
-                pass
-
-    # 6. data-offerid
     body = soup.find("body")
-    if body and body.get("data-offerid"):
-        val = body["data-offerid"]
-        if val.isdigit():
-            logger.info(f"[ID] Найден в data-offerid: {val}")
-            return val
+    if body and body.get("data-offerid") and body["data-offerid"].isdigit():
+        return body["data-offerid"]
 
-    # 7. Скрытые инпуты
     for inp in soup.find_all("input", type="hidden"):
-        name = (inp.get("name") or "").lower()
-        if name in ("offerid", "adid", "id") and inp.get("value", "").isdigit():
-            logger.info(f"[ID] Найден в hidden input {name}: {inp['value']}")
+        if inp.get("name") in ("offerId", "adId", "id") and inp.get("value", "").isdigit():
             return inp["value"]
 
     return None
@@ -165,53 +137,33 @@ def extract_price(html: str) -> int | None:
         logger.error(f"Ошибка парсинга цены: {e}")
         return None
 
-def check_negotiation_possible(html: str) -> bool:
-    """Проверяет, есть ли на странице флаг allow_negotiation или кнопка 'Предложить цену'."""
-    # Ищем в JS-данных
-    match = re.search(r'"allowNegotiation"\s*:\s*true', html)
+def extract_bearer_token(html: str, cookie_dict: dict) -> str | None:
+    # Пробуем access_token из кук (JSON-массив)
+    token = cookie_dict.get("access_token")
+    if token:
+        logger.info("Bearer токен взят из access_token в куках")
+        return token
+
+    # Ищем в HTML-конфиге
+    match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', html)
     if match:
+        logger.info("Bearer токен найден в HTML (accessToken)")
+        return match.group(1)
+    match = re.search(r'"token"\s*:\s*"([^"]+)"', html)
+    if match:
+        logger.info("Bearer токен найден в HTML (token)")
+        return match.group(1)
+
+    return None
+
+def check_negotiation(html: str) -> bool:
+    # Проверяем флаги в JSON-конфиге
+    if re.search(r'"negotiable"\s*:\s*true', html) and re.search(r'"can_chat"\s*:\s*true', html):
         return True
-    # Ищем кнопку по тексту
-    soup = BeautifulSoup(html, "html.parser")
-    for button in soup.find_all(["button", "a"]):
-        text = button.get_text(strip=True).lower()
-        if "предложить цену" in text or "propose price" in text:
-            return True
+    # Кнопка "Negocjuj cenę"
+    if "Negocjuj cenę" in html or "Предложить цену" in html:
+        return True
     return False
-
-def send_price_proposal(session, numeric_id, proposal, url, cookie_dict):
-    """Пытается отправить предложение. Возвращает (success, error_message)."""
-    # Пробуем несколько эндпоинтов
-    endpoints = [
-        f"https://www.olx.pl/api/v1/offers/{numeric_id}/propose-price/",
-        f"https://www.olx.pl/api/v1/offers/{numeric_id}/propose/",
-    ]
-    headers = session.headers.copy()
-    headers.update({"Content-Type": "application/json"})
-
-    # XSRF-токен
-    xsrf_token = session.cookies.get("XSRF-TOKEN", domain=".olx.pl")
-    if xsrf_token:
-        xsrf_token = urllib.parse.unquote(xsrf_token)
-        headers["X-XSRF-TOKEN"] = xsrf_token
-
-    access_token = cookie_dict.get("access_token")
-    if access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
-
-    payload = {"price": int(proposal), "currency": "PLN"}
-
-    for endpoint in endpoints:
-        try:
-            resp = session.post(endpoint, json=payload, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                return True, None
-            else:
-                logger.warning(f"Эндпоинт {endpoint} вернул {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            logger.error(f"Ошибка при запросе к {endpoint}: {e}")
-    # Если оба не сработали
-    return False, "Все эндпоинты вернули ошибку. Проверьте, поддерживает ли объявление торг."
 
 def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) -> dict:
     result = {"url": url}
@@ -226,43 +178,43 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
         return result
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "pl-PL,pl;q=0.9",
     }
     session.headers.update(headers)
 
+    # 1. GET страницы
     try:
         resp = session.get(url, timeout=15)
         resp.raise_for_status()
         html = resp.text
     except Exception as e:
         result["success"] = False
-        result["error"] = f"Ошибка загрузки страницы: {e}"
+        result["error"] = f"Ошибка загрузки: {e}"
         return result
 
-    # ID
+    # Извлекаем числовой ID
     numeric_id = extract_numeric_id(html, url)
     if not numeric_id:
         result["success"] = False
-        result["error"] = "Не удалось найти числовой ID объявления. Возможно, ссылка неверна или страница изменилась."
+        result["error"] = "Не удалось найти числовой ID объявления"
         return result
-    result["numeric_id"] = numeric_id  # для отладки
+    result["numeric_id"] = numeric_id
 
     # Проверка возможности торга
-    if not check_negotiation_possible(html):
+    if not check_negotiation(html):
         result["success"] = False
-        result["error"] = "Объявление не поддерживает предложение цены (нет кнопки или флага)."
+        result["error"] = "Объявление не поддерживает предложение цены"
         return result
 
     # Цена
     original_price = extract_price(html)
     if original_price is None:
         result["success"] = False
-        result["error"] = "Не удалось определить цену на странице."
+        result["error"] = "Не удалось определить цену"
         return result
 
-    # Вычисление предложения
     if original_price <= 300:
         proposal = original_price - 5
     elif original_price <= 1000:
@@ -271,24 +223,77 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
         proposal = original_price - 20
     proposal = max(proposal, 1)
 
-    logger.info(f"[{url}] Найден ID={numeric_id}, цена={original_price}, предложение={proposal}")
+    # Bearer токен
+    bearer_token = extract_bearer_token(html, cookie_dict)
+    if not bearer_token:
+        result["success"] = False
+        result["error"] = "Не найден Bearer токен (ни в куках, ни на странице)"
+        return result
+
+    # XSRF-токен
+    xsrf_token = session.cookies.get("XSRF-TOKEN", domain=".olx.pl")
+    if xsrf_token:
+        xsrf_token = urllib.parse.unquote(xsrf_token)
+        session.headers.update({"X-XSRF-TOKEN": xsrf_token})
+
+    # Устанавливаем авторизацию
+    session.headers.update({
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+    })
 
     # Задержка
+    logger.info(f"Ожидание {delay} сек перед отправкой для {url}")
     time.sleep(delay)
 
-    # Отправка
-    success, error_msg = send_price_proposal(session, numeric_id, proposal, url, cookie_dict)
-    if success:
-        result["success"] = True
-        result["original_price"] = original_price
-        result["proposed_price"] = proposal
-    else:
+    # 2. Создание/получение чат-потока
+    thread_url = "https://www.olx.pl/api/v1/chat/threads/"
+    thread_payload = {
+        "ad_id": int(numeric_id),
+        "text": ""
+    }
+    try:
+        thread_resp = session.post(thread_url, json=thread_payload, timeout=15)
+        if thread_resp.status_code not in (200, 201):
+            result["success"] = False
+            result["error"] = f"Не удалось создать чат (код {thread_resp.status_code}): {thread_resp.text[:200]}"
+            return result
+        thread_data = thread_resp.json()
+        thread_id = thread_data.get("id") or thread_data.get("data", {}).get("id")
+        if not thread_id:
+            result["success"] = False
+            result["error"] = "Не удалось извлечь ID чата из ответа"
+            return result
+        logger.info(f"Чат создан/получен: {thread_id}")
+    except Exception as e:
         result["success"] = False
-        result["error"] = error_msg
+        result["error"] = f"Ошибка создания чата: {e}"
+        return result
+
+    # 3. Отправка предложения цены
+    message_url = f"https://www.olx.pl/api/v1/chat/threads/{thread_id}/messages/"
+    message_payload = {
+        "type": "price_proposal",
+        "proposal_value": int(proposal),
+        "text": f"Proponuję cenę {proposal} zł."
+    }
+    try:
+        msg_resp = session.post(message_url, json=message_payload, timeout=15)
+        if msg_resp.status_code in (200, 201):
+            result["success"] = True
+            result["original_price"] = original_price
+            result["proposed_price"] = proposal
+            logger.info(f"✅ Предложение {proposal} zł отправлено для {numeric_id}")
+        else:
+            result["success"] = False
+            result["error"] = f"Ошибка отправки предложения (код {msg_resp.status_code}): {msg_resp.text[:200]}"
+    except Exception as e:
+        result["success"] = False
+        result["error"] = f"Ошибка отправки сообщения: {e}"
 
     return result
 
-# ========== HTML (без изменений) ==========
+# ========== HTML-страница ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
