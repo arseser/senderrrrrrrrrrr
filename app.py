@@ -108,92 +108,15 @@ def extract_price(html: str) -> int | None:
         logger.error(f"Ошибка парсинга цены: {e}")
         return None
 
-def extract_bearer_token(html: str, cookie_dict: dict) -> str | None:
-    # 1. Из кук (самый надёжный)
+def extract_bearer_token(cookie_dict: dict) -> str | None:
     token = cookie_dict.get("access_token")
     if token:
-        logger.info("Bearer токен из кук (access_token)")
+        logger.info("Bearer токен из кук")
         return token
-    # 2. Из HTML
-    match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', html)
-    if match:
-        return match.group(1)
-    match = re.search(r'"token"\s*:\s*"([^"]+)"', html)
-    if match:
-        return match.group(1)
     return None
 
-def check_negotiation(html: str) -> bool:
-    """Проверяет возможность торга по Клоду: data-testid + negotiable флаг + текст кнопки"""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1. Кнопка по data-testid (самый надёжный)
-    btn = soup.find("button", attrs={"data-testid": "make-an-offer-button"})
-    if btn:
-        logger.info("Найдена кнопка make-an-offer-button")
-        return True
-
-    # 2. Флаг negotiable в __INITIAL_STATE__
-    if re.search(r'"negotiable"\s*:\s*true', html):
-        logger.info("Флаг negotiable: true")
-        return True
-
-    # 3. Текст кнопки (запасной)
-    if "Negocjuj cenę" in html or "Предложить цену" in html:
-        logger.info("Текст Negocjuj cenę найден")
-        return True
-
-    return False
-
-def get_or_create_thread(session, numeric_id, bearer_token):
-    """Сначала ищет существующий чат, если нет — создаёт новый."""
-    api_headers = {
-        "Authorization": f"Bearer {bearer_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    # 1. Поиск существующего чата
-    try:
-        resp = session.get(
-            "https://www.olx.pl/api/v1/chat/threads/",
-            params={"ad_id": int(numeric_id)},
-            headers=api_headers,
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0:
-                tid = data[0].get("id")
-                if tid:
-                    logger.info(f"Найден чат: {tid}")
-                    return tid
-            elif isinstance(data, dict):
-                tid = data.get("id")
-                if tid:
-                    return tid
-    except Exception as e:
-        logger.warning(f"Ошибка поиска чата: {e}")
-
-    # 2. Создание нового
-    try:
-        resp = session.post(
-            "https://www.olx.pl/api/v1/chat/threads/",
-            json={"ad_id": int(numeric_id), "text": ""},
-            headers=api_headers,
-            timeout=15,
-        )
-        logger.info(f"Создание чата: статус {resp.status_code}, ответ: {resp.text[:300]}")
-        if resp.status_code in (200, 201):
-            data = resp.json()
-            tid = data.get("id") or (data.get("data", {}) or {}).get("id")
-            if tid:
-                logger.info(f"Чат создан: {tid}")
-                return tid
-    except Exception as e:
-        logger.error(f"Ошибка создания чата: {e}")
-
-    return None
+def extract_device_guid(cookie_dict: dict) -> str | None:
+    return cookie_dict.get("deviceGUID")
 
 def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) -> dict:
     result = {"url": url, "numeric_id": numeric_id}
@@ -223,11 +146,6 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int 
         result["error"] = f"Ошибка загрузки: {e}"
         return result
 
-    if not check_negotiation(html):
-        result["success"] = False
-        result["error"] = "Нет кнопки Negocjuj cenę"
-        return result
-
     original_price = extract_price(html)
     if original_price is None:
         result["success"] = False
@@ -242,44 +160,71 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int 
         proposal = original_price - 20
     proposal = max(proposal, 1)
 
-    # Bearer токен ПЕРВЫМ ДЕЛОМ из кук
-    bearer_token = extract_bearer_token(html, cookie_dict)
+    bearer_token = extract_bearer_token(cookie_dict)
     if not bearer_token:
         result["success"] = False
-        result["error"] = "Не найден Bearer токен в куках"
+        result["error"] = "Не найден access_token в куках"
         return result
 
-    xsrf_token = session.cookies.get("XSRF-TOKEN", domain=".olx.pl")
-    if xsrf_token:
-        xsrf_token = urllib.parse.unquote(xsrf_token)
-        session.headers.update({"X-XSRF-TOKEN": xsrf_token})
+    device_guid = extract_device_guid(cookie_dict)
+
+    api_headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    if device_guid:
+        api_headers["X-Device-Id"] = device_guid
 
     time.sleep(delay)
 
-    thread_id = get_or_create_thread(session, numeric_id, bearer_token)
-    if not thread_id:
+    # Шаг 1: Создать чат с первым сообщением
+    thread_url = "https://www.olx.pl/api/v1/chat/threads/"
+    thread_payload = {
+        "ad_id": int(numeric_id),
+        "text": f"Dzień dobry, proponuję cenę {proposal} zł."
+    }
+
+    try:
+        thread_resp = session.post(thread_url, json=thread_payload, headers=api_headers, timeout=15)
+        logger.info(f"Создание чата: статус {thread_resp.status_code}, ответ: {thread_resp.text[:400]}")
+        if thread_resp.status_code not in (200, 201):
+            result["success"] = False
+            result["error"] = f"Ошибка создания чата: {thread_resp.status_code} - {thread_resp.text[:200]}"
+            return result
+        thread_data = thread_resp.json()
+        thread_id = thread_data.get("id") or (thread_data.get("data", {}) or {}).get("id")
+        if not thread_id:
+            result["success"] = False
+            result["error"] = f"Не получен ID чата. Ответ: {thread_resp.text[:300]}"
+            return result
+        logger.info(f"Чат создан: {thread_id}")
+    except Exception as e:
         result["success"] = False
-        result["error"] = "Не удалось найти или создать чат"
+        result["error"] = f"Ошибка создания чата: {e}"
         return result
 
+    # Шаг 2: Отправить price_proposal в чат
     message_url = f"https://www.olx.pl/api/v1/chat/threads/{thread_id}/messages/"
     message_payload = {
         "type": "price_proposal",
         "proposal_value": int(proposal),
-        "text": f"Proponuje cene {proposal} zl."
+        "text": f"Proponuję cenę {proposal} zł."
     }
     try:
-        msg_resp = session.post(message_url, json=message_payload, timeout=15)
+        msg_resp = session.post(message_url, json=message_payload, headers=api_headers, timeout=15)
+        logger.info(f"Отправка предложения: статус {msg_resp.status_code}, ответ: {msg_resp.text[:300]}")
         if msg_resp.status_code in (200, 201):
             result["success"] = True
             result["original_price"] = original_price
             result["proposed_price"] = proposal
         else:
             result["success"] = False
-            result["error"] = f"Ошибка отправки: {msg_resp.status_code}"
+            result["error"] = f"Ошибка предложения: {msg_resp.status_code} - {msg_resp.text[:200]}"
     except Exception as e:
         result["success"] = False
-        result["error"] = f"Ошибка сообщения: {e}"
+        result["error"] = f"Ошибка отправки предложения: {e}"
 
     return result
 
@@ -324,7 +269,7 @@ HTML_PAGE = r"""
     </style>
 </head>
 <body>
-    <h1>ROCKET OLX Price Proposer</h1>
+    <h1>🚀 ROCKET OLX Price Proposer</h1>
     <div class="box">
         <h3>Добавить куку</h3>
         <label>Имя куки:</label>
@@ -341,7 +286,7 @@ HTML_PAGE = r"""
         <label>Ссылки на товары (до 20, по одной на строку):</label>
         <textarea id="offerUrls" rows="6" placeholder="https://www.olx.pl/d/oferta/...&#10;https://www.olx.pl/d/oferta/...&#10;..."></textarea>
         <div class="hint">После нажатия Отправить — для каждой ссылки спросит ID.</div>
-        <button id="sendBtn">Отправить все</button>
+        <button id="sendBtn">🚀 Отправить все</button>
     </div>
     <div class="modal-overlay" id="idModal">
         <div class="modal">
@@ -356,7 +301,7 @@ HTML_PAGE = r"""
     </div>
     <div class="modal-overlay" id="resultsModal">
         <div class="modal" style="max-width:700px;max-height:80vh;display:flex;flex-direction:column;">
-            <h2>Результаты отправки</h2>
+            <h2>📋 Результаты отправки</h2>
             <div id="resultsContent" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:10px;"></div>
             <button class="btn-cancel" id="resultsClose" style="align-self:flex-end;margin-top:10px;">Закрыть</button>
         </div>
