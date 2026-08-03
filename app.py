@@ -85,61 +85,56 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
     return result
 
 def extract_numeric_id(html: str, url: str = "") -> str | None:
-    # 1. Прямой regex по всему HTML — самый надёжный
-    match = re.search(r'"id"\s*:\s*(\d{7,})', html)
+    """
+    Три метода от Клода:
+    1. Из URL: -ID123aBc.html → оставляем только цифры
+    2. Из window.__INITIAL_STATE__
+    3. Прямой regex: "id":число,"title"
+    """
+    # 1. Из URL
+    if url:
+        match = re.search(r'-ID([a-zA-Z0-9]+)\.html', url)
+        if match:
+            raw_id = match.group(1)
+            numeric_id = re.sub(r'\D', '', raw_id)
+            if numeric_id and len(numeric_id) >= 7:
+                logger.info(f"ID из URL: {numeric_id}")
+                return numeric_id
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 2. window.__INITIAL_STATE__
+    script_tag = soup.find("script", string=re.compile(r'window\.__INITIAL_STATE__'))
+    if script_tag and script_tag.string:
+        json_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', script_tag.string)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                ad_id = data.get("ad", {}).get("currentAd", {}).get("id")
+                if ad_id:
+                    logger.info(f"ID из __INITIAL_STATE__: {ad_id}")
+                    return str(ad_id)
+            except Exception:
+                pass
+
+    # 3. Прямой regex по всему HTML: "id":число,"title"
+    match = re.search(r'"id"\s*:\s*(\d+)\s*,\s*"title"', html)
     if match:
-        logger.info(f"ID найден прямым regex: {match.group(1)}")
+        logger.info(f"ID через regex id+title: {match.group(1)}")
         return match.group(1)
 
-    # 2. olx-init-config
-    soup = BeautifulSoup(html, "html.parser")
-    init_config = soup.find("script", id="olx-init-config")
-    if init_config and init_config.string:
-        try:
-            config = json.loads(init_config.string)
-            for path in [
-                ["ad", "ad", "id"],
-                ["ad", "id"],
-                ["props", "pageProps", "ad", "id"],
-                ["data", "ad", "id"],
-            ]:
-                val = config
-                for key in path:
-                    if isinstance(val, dict):
-                        val = val.get(key)
-                    else:
-                        val = None
-                        break
-                if val and str(val).isdigit() and len(str(val)) >= 7:
-                    logger.info(f"ID из olx-init-config: {val}")
-                    return str(val)
-        except Exception:
-            pass
+    # 4. Запасной: любой "id": 7+ цифр
+    match = re.search(r'"id"\s*:\s*(\d{7,})', html)
+    if match:
+        logger.info(f"ID через regex 7+ цифр: {match.group(1)}")
+        return match.group(1)
 
-    # 3. meta al:android:url
+    # 5. meta al:android:url
     meta = soup.find("meta", property="al:android:url")
     if meta and meta.get("content"):
         match = re.search(r'item/(\d+)', meta["content"])
         if match:
             return match.group(1)
-
-    # 4. og:url
-    meta = soup.find("meta", property="og:url")
-    if meta and meta.get("content"):
-        match = re.search(r'-ID(\d+)\.html', meta["content"])
-        if match:
-            return match.group(1)
-
-    # 5. Из URL
-    if url:
-        match = re.search(r'/(\d{7,})(?:\.html|$|\?)', url)
-        if match:
-            return match.group(1)
-
-    # 6. data-offerid
-    body = soup.find("body")
-    if body and body.get("data-offerid") and body["data-offerid"].isdigit():
-        return body["data-offerid"]
 
     return None
 
