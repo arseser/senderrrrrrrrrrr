@@ -109,20 +109,20 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка загрузки страницы: {e}"}
 
-    # ========== НОВЫЙ УНИВЕРСАЛЬНЫЙ ПОИСК OFFER_ID ==========
+    # ========== НОВЫЙ СУПЕР-ПОИСК OFFER_ID (ГЛАВНОЕ ИСПРАВЛЕНИЕ) ==========
     offer_id = None
 
-    # 1. Прямой поиск в URL: -ID-xxxxxxxx.html или -id-xxxxxxxx.html (регистронезависимо)
+    # 1. Из URL: паттерны ...-ID-xxxxx.html или ...-id-xxxxx.html
     match = re.search(r'/[^/]*[_-]id[_-](\w+)\.html', url, re.IGNORECASE)
     if match:
         offer_id = match.group(1)
     else:
-        # 2. Ищем в URL числовой ID в конце (например, /oferta/123456789)
+        # 2. Числовой ID в конце URL (например, /oferta/123456789)
         match = re.search(r'/(\d{7,})(?:\.html)?$', url)
         if match:
             offer_id = match.group(1)
 
-    # 3. Если не нашли, ищем в og:url на странице
+    # 3. Из og:url страницы
     if not offer_id:
         soup = BeautifulSoup(html, "html.parser")
         meta_og = soup.find("meta", property="og:url")
@@ -136,22 +136,55 @@ def propose_price(url: str, cookie_str: str) -> dict:
                 if match:
                     offer_id = match.group(1)
 
-    # 4. Пробуем достать из window.__INITIAL_STATE__ или другого JSON на странице
+    # 4. Из data-cy="ad.id" (часто на новых страницах OLX)
+    if not offer_id:
+        elem = soup.find(attrs={"data-cy": "ad.id"})
+        if elem:
+            offer_id = elem.text.strip()
+            if not offer_id.isdigit():
+                # иногда id в data-cy="ad.id" внутри атрибута
+                offer_id = elem.get("data-testid") or elem.get("data-id")
+
+    # 5. Из <meta itemprop="productID" content="...">
+    if not offer_id:
+        meta_product = soup.find("meta", itemprop="productID")
+        if meta_product and meta_product.get("content"):
+            offer_id = meta_product["content"].strip()
+
+    # 6. Из скрытого input или любого тега с id="offer_id"
+    if not offer_id:
+        tag = soup.find(id="offer_id")
+        if tag and tag.get("value"):
+            offer_id = tag["value"]
+
+    # 7. Из data-offerid (атрибут на основном div'е)
+    if not offer_id:
+        elem = soup.find(attrs={"data-offerid": True})
+        if elem:
+            offer_id = elem["data-offerid"]
+
+    # 8. Попытка достать из JS: ad_id: 123456
     if not offer_id:
         match = re.search(r'"ad_id"\s*:\s*"?(\d+)"?', html)
         if match:
             offer_id = match.group(1)
 
-    # 5. Ищем в микроразметке (data-offerid)
+    # 9. Поиск в JSON внутри скрипта window.__INITIAL_STATE__
     if not offer_id:
-        match = re.search(r'data-offerid\s*=\s*["\'](\d+)["\']', html)
+        match = re.search(r'"adId"\s*:\s*"?(\d+)"?', html)
+        if match:
+            offer_id = match.group(1)
+
+    # 10. Просто любое число из 7+ цифр в og:url, если ничего не нашли (последняя надежда)
+    if not offer_id:
+        match = re.search(r'/(\d{7,})', url)
         if match:
             offer_id = match.group(1)
 
     if not offer_id:
         return {"success": False, "error": "Не удалось извлечь ID объявления. Проверьте ссылку."}
 
-    # ========== ДАЛЕЕ ВСЁ БЕЗ ИЗМЕНЕНИЙ ==========
+    # ========== ДАЛЕЕ КОД БЕЗ ИЗМЕНЕНИЙ ==========
     original_price = extract_price(html)
     if original_price is None:
         return {"success": False, "error": "Не удалось определить цену на странице"}
