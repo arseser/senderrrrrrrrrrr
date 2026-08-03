@@ -74,18 +74,12 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
     return result
 
 def extract_numeric_id(html: str, url: str = "") -> str | None:
-    """
-    Извлекает числовой ID объявления.
-    ПРИОРИТЕТ: JSON-конфиг olx-init-config (как сказал Клод).
-    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. Основной источник: <script id="olx-init-config">
     init_config = soup.find("script", id="olx-init-config")
     if init_config and init_config.string:
         try:
             config = json.loads(init_config.string)
-            # Ищем ID в разных возможных путях
             for path in [
                 ["ad", "ad", "id"],
                 ["ad", "id"],
@@ -104,7 +98,6 @@ def extract_numeric_id(html: str, url: str = "") -> str | None:
                 if val and str(val).isdigit():
                     logger.info(f"ID найден в olx-init-config (путь {path}): {val}")
                     return str(val)
-            # Если не нашли по путям, поищем рекурсивно "id": число в конфиге
             config_str = json.dumps(config)
             match = re.search(r'"id"\s*:\s*(\d{7,})', config_str)
             if match:
@@ -113,44 +106,34 @@ def extract_numeric_id(html: str, url: str = "") -> str | None:
         except Exception as e:
             logger.warning(f"Не удалось распарсить olx-init-config: {e}")
 
-    # 2. Резерв: meta al:android:url
     meta = soup.find("meta", property="al:android:url")
     if meta and meta.get("content"):
         match = re.search(r'item/(\d+)', meta["content"])
         if match:
-            logger.info(f"ID найден в al:android:url: {match.group(1)}")
             return match.group(1)
 
-    # 3. Резерв: og:url
     meta = soup.find("meta", property="og:url")
     if meta and meta.get("content"):
         match = re.search(r'-ID(\d+)\.html', meta["content"])
         if match:
-            logger.info(f"ID найден в og:url: {match.group(1)}")
             return match.group(1)
 
-    # 4. Резерв: URL
     if url:
         match = re.search(r'/(\d{7,})(?:\.html|$)', url)
         if match:
-            logger.info(f"ID найден в URL: {match.group(1)}")
             return match.group(1)
 
-    # 5. Резерв: другие скрипты
     for script in soup.find_all("script"):
         if script.string:
             for pattern in [r'"adId"\s*:\s*"?(\d+)"?', r'"ad_id"\s*:\s*"?(\d+)"?', r'"offerId"\s*:\s*"?(\d+)"?']:
                 match = re.search(pattern, script.string)
                 if match:
-                    logger.info(f"ID найден в JS: {match.group(1)}")
                     return match.group(1)
 
-    # 6. data-offerid на body
     body = soup.find("body")
     if body and body.get("data-offerid") and body["data-offerid"].isdigit():
         return body["data-offerid"]
 
-    # 7. Скрытые инпуты
     for inp in soup.find_all("input", type="hidden"):
         if inp.get("name") in ("offerId", "adId", "id") and inp.get("value", "").isdigit():
             return inp["value"]
@@ -313,7 +296,7 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
 
     return result
 
-# ========== HTML (интерфейс без изменений) ==========
+# ========== ИСПРАВЛЕННЫЙ HTML С ГАРАНТИРОВАННОЙ РАБОТОЙ ДОБАВЛЕНИЯ КУК ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -351,6 +334,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
     <h1>🚀 ROCKET OLX Price Proposer</h1>
+
     <div class="box">
         <h3>Добавить куку</h3>
         <label>Имя куки:</label>
@@ -360,15 +344,19 @@ HTML_PAGE = """<!DOCTYPE html>
         <button onclick="addCookie()">Добавить</button>
         <span id="addStatus"></span>
     </div>
+
     <div class="box">
         <h3>Отправить предложения</h3>
         <label>Выбрать куку:</label>
-        <select id="cookieSelect"><option value="">-- Загружаю список... --</option></select>
+        <select id="cookieSelect">
+            <option value="">-- Загружаю список... --</option>
+        </select>
         <label>Ссылки на товары (до 20, по одной на строку):</label>
         <textarea id="offerUrls" rows="6" placeholder="https://www.olx.pl/d/oferta/...&#10;https://www.olx.pl/d/oferta/...&#10;..."></textarea>
         <div class="hint">Максимум 20 ссылок. Задержка 10 сек между отправками.</div>
         <button id="sendBtn" onclick="sendProposals()">🚀 Отправить все</button>
     </div>
+
     <div class="modal-overlay" id="modalOverlay">
         <div class="modal">
             <h2>📋 Результаты отправки</h2>
@@ -376,58 +364,124 @@ HTML_PAGE = """<!DOCTYPE html>
             <button class="modal-close" onclick="closeModal()">Закрыть</button>
         </div>
     </div>
+
     <script>
+        // Загрузка списка кук
         async function loadCookies() {
-            const resp = await fetch('/api/cookies');
-            const list = await resp.json();
-            const select = document.getElementById('cookieSelect');
-            select.innerHTML = '<option value="">-- Выберите куку --</option>';
-            list.forEach(name => {
-                const opt = document.createElement('option');
-                opt.value = name;
-                opt.textContent = name;
-                select.appendChild(opt);
-            });
+            try {
+                const resp = await fetch('/api/cookies');
+                const list = await resp.json();
+                const select = document.getElementById('cookieSelect');
+                select.innerHTML = '<option value="">-- Выберите куку --</option>';
+                list.forEach(name => {
+                    const opt = document.createElement('option');
+                    opt.value = name;
+                    opt.textContent = name;
+                    select.appendChild(opt);
+                });
+            } catch (e) {
+                console.error('Ошибка загрузки кук:', e);
+            }
         }
-        loadCookies();
+
+        // Добавление куки
         async function addCookie() {
-            const name = document.getElementById('cookieName').value.trim();
-            const cookie = document.getElementById('cookieValue').value.trim();
+            const nameInput = document.getElementById('cookieName');
+            const valueInput = document.getElementById('cookieValue');
             const status = document.getElementById('addStatus');
-            if (!name || !cookie) { status.innerHTML = '<span class="error">Заполните оба поля</span>'; return; }
-            const resp = await fetch('/api/cookies', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ name, cookie }) });
-            const data = await resp.json();
-            if (data.success) { status.innerHTML = '<span class="success">Кука добавлена!</span>'; loadCookies(); document.getElementById('cookieName').value = ''; document.getElementById('cookieValue').value = ''; }
-            else { status.innerHTML = `<span class="error">Ошибка: ${data.error}</span>`; }
+            const name = nameInput.value.trim();
+            const cookie = valueInput.value.trim();
+
+            if (!name || !cookie) {
+                status.innerHTML = '<span class="error">Заполните оба поля</span>';
+                return;
+            }
+
+            try {
+                const resp = await fetch('/api/cookies', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name, cookie })
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    status.innerHTML = '<span class="success">Кука добавлена!</span>';
+                    nameInput.value = '';
+                    valueInput.value = '';
+                    loadCookies(); // обновляем список
+                } else {
+                    status.innerHTML = `<span class="error">Ошибка: ${data.error}</span>`;
+                }
+            } catch (e) {
+                status.innerHTML = `<span class="error">Ошибка соединения: ${e}</span>`;
+            }
         }
-        function closeModal() { document.getElementById('modalOverlay').classList.remove('active'); }
+
+        function closeModal() {
+            document.getElementById('modalOverlay').classList.remove('active');
+        }
+
         async function sendProposals() {
             const cookie_name = document.getElementById('cookieSelect').value;
             const urlsText = document.getElementById('offerUrls').value.trim();
             const sendBtn = document.getElementById('sendBtn');
             const modalOverlay = document.getElementById('modalOverlay');
             const modalResults = document.getElementById('modalResults');
-            if (!cookie_name || !urlsText) { alert('Выберите куку и введите ссылки'); return; }
+
+            if (!cookie_name || !urlsText) {
+                alert('Выберите куку и введите ссылки');
+                return;
+            }
+
             const urls = urlsText.split('\n').map(u => u.trim()).filter(u => u.length > 0);
-            if (urls.length === 0) { alert('Нет ссылок'); return; }
-            if (urls.length > 20) { alert('Максимум 20 ссылок'); return; }
+            if (urls.length === 0) {
+                alert('Нет ссылок');
+                return;
+            }
+            if (urls.length > 20) {
+                alert('Максимум 20 ссылок');
+                return;
+            }
+
             sendBtn.disabled = true;
             sendBtn.innerHTML = '<span class="spinner"></span>Отправка...';
-            modalResults.innerHTML = urls.map((url, i) => `<div class="result-card" id="card-${i}"><div class="url">${url}</div><div>⏳ Ожидание...</div></div>`).join('');
+
+            modalResults.innerHTML = urls.map((url, i) => 
+                `<div class="result-card" id="card-${i}">
+                    <div class="url">${url}</div>
+                    <div>⏳ Ожидание...</div>
+                </div>`
+            ).join('');
             modalOverlay.classList.add('active');
+
             try {
-                const resp = await fetch('/api/propose_batch', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ cookie_name, urls }) });
+                const resp = await fetch('/api/propose_batch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ cookie_name, urls })
+                });
                 const data = await resp.json();
+
                 if (data.results) {
                     data.results.forEach((r, i) => {
                         const card = document.getElementById(`card-${i}`);
                         if (!card) return;
                         if (r.success) {
                             card.className = 'result-card success';
-                            card.innerHTML = `<div class="url">🔗 ${r.url}</div><div>💰 Оригинальная цена: <span class="price">${r.original_price} zł</span></div><div>📉 Предложено: <span class="price">${r.proposed_price} zł</span></div><div>🆔 ID: ${r.numeric_id}</div><div>✅ Успешно отправлено</div>`;
+                            card.innerHTML = `
+                                <div class="url">🔗 ${r.url}</div>
+                                <div>💰 Оригинальная цена: <span class="price">${r.original_price} zł</span></div>
+                                <div>📉 Предложено: <span class="price">${r.proposed_price} zł</span></div>
+                                <div>🆔 ID: ${r.numeric_id}</div>
+                                <div>✅ Успешно отправлено</div>
+                            `;
                         } else {
                             card.className = 'result-card error';
-                            card.innerHTML = `<div class="url">🔗 ${r.url}</div><div>❌ ${r.error}</div>${r.numeric_id ? `<div>🆔 Найденный ID: ${r.numeric_id}</div>` : ''}`;
+                            card.innerHTML = `
+                                <div class="url">🔗 ${r.url}</div>
+                                <div>❌ ${r.error}</div>
+                                ${r.numeric_id ? `<div>🆔 Найденный ID: ${r.numeric_id}</div>` : ''}
+                            `;
                         }
                     });
                 }
@@ -438,6 +492,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 sendBtn.innerHTML = '🚀 Отправить все';
             }
         }
+
+        // Загружаем список кук при старте
+        loadCookies();
     </script>
 </body>
 </html>"""
@@ -465,6 +522,7 @@ def manage_cookies():
             cookies = load_cookies()
             cookies[name] = cookie_str
             save_cookies(cookies)
+            logger.info(f"Кука '{name}' добавлена/обновлена")
             return jsonify({"success": True})
     except Exception as e:
         err = traceback.format_exc()
