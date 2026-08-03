@@ -8,7 +8,6 @@ import urllib.parse
 from flask import Flask, request, jsonify
 import requests
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
@@ -24,11 +23,11 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 UPSTASH_HEADERS = {"Authorization": f"Bearer {UPSTASH_TOKEN}"} if UPSTASH_TOKEN else {}
 COOKIES_KEY = "olx_cookies"
 MESSAGE_TEXT_KEY = "message_text"
+BYPASS_MODE_KEY = "bypass_mode"
 
 MAX_URLS = 20
-MAX_WORKERS = 5
 DELAY_BETWEEN = 10
-DEFAULT_MESSAGE = "Dzień dobry, czy jest jeszcze dostępne? Pozdrawiam"
+DEFAULT_MESSAGE = "Dzień dobry, czy jest jeszcze dostępne?"
 
 def load_data(key):
     if not UPSTASH_URL:
@@ -36,9 +35,7 @@ def load_data(key):
     try:
         resp = requests.get(f"{UPSTASH_URL}/get/{key}", headers=UPSTASH_HEADERS, timeout=10)
         result = resp.json().get("result")
-        if result:
-            return json.loads(result)
-        return None
+        return json.loads(result) if result else None
     except Exception as e:
         logger.error(f"Ошибка загрузки {key}: {e}")
         return None
@@ -47,13 +44,7 @@ def save_data(key, data):
     if not UPSTASH_URL:
         return
     try:
-        payload = json.dumps(data, ensure_ascii=False)
-        requests.post(
-            f"{UPSTASH_URL}/set/{key}",
-            headers=UPSTASH_HEADERS,
-            data=payload.encode("utf-8"),
-            timeout=10,
-        )
+        requests.post(f"{UPSTASH_URL}/set/{key}", headers=UPSTASH_HEADERS, data=json.dumps(data, ensure_ascii=False).encode(), timeout=10)
     except Exception as e:
         logger.error(f"Ошибка сохранения {key}: {e}")
 
@@ -69,6 +60,12 @@ def load_message_text():
 
 def save_message_text(text):
     save_data(MESSAGE_TEXT_KEY, text)
+
+def load_bypass_mode():
+    return load_data(BYPASS_MODE_KEY) or False
+
+def save_bypass_mode(val):
+    save_data(BYPASS_MODE_KEY, bool(val))
 
 def cookie_str_to_dict(cookie_str: str) -> dict:
     if not cookie_str:
@@ -123,12 +120,6 @@ def extract_price(html: str) -> int | None:
         logger.error(f"Ошибка парсинга цены: {e}")
         return None
 
-def extract_bearer_token(cookie_dict: dict) -> str | None:
-    return cookie_dict.get("access_token")
-
-def extract_device_guid(cookie_dict: dict) -> str | None:
-    return cookie_dict.get("deviceGUID")
-
 def process_single_url(url: str, numeric_id: str, cookie_dict: dict, message_text: str, delay: int = DELAY_BETWEEN) -> dict:
     result = {"url": url, "numeric_id": numeric_id}
 
@@ -158,35 +149,26 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, message_tex
         return result
 
     original_price = extract_price(html)
-    if original_price is None:
-        result["success"] = False
-        result["error"] = "Не удалось определить цену"
-        return result
+    proposal = None
+    if original_price:
+        if original_price <= 300:
+            proposal = original_price - 5
+        elif original_price <= 1000:
+            proposal = original_price - 10
+        else:
+            proposal = original_price - 20
+        proposal = max(proposal, 1)
 
-    if original_price <= 300:
-        proposal = original_price - 5
-    elif original_price <= 1000:
-        proposal = original_price - 10
-    else:
-        proposal = original_price - 20
-    proposal = max(proposal, 1)
-
-    bearer_token = extract_bearer_token(cookie_dict)
+    bearer_token = cookie_dict.get("access_token")
     if not bearer_token:
         result["success"] = False
         result["error"] = "Не найден access_token в куках"
         return result
 
-    device_guid = extract_device_guid(cookie_dict)
+    device_guid = cookie_dict.get("deviceGUID")
+    xsrf_token = session.cookies.get("XSRF-TOKEN", domain=".olx.pl")
 
     time.sleep(delay)
-
-    # Эндпоинт создания чата из ответов Клода ранее
-    thread_url = "https://www.olx.pl/api/v1/chat/threads/"
-    thread_payload = {
-        "ad_id": int(numeric_id),
-        "text": message_text
-    }
 
     api_headers = {
         "Authorization": f"Bearer {bearer_token}",
@@ -199,21 +181,70 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, message_tex
     }
     if device_guid:
         api_headers["X-Device-Id"] = device_guid
+    if xsrf_token:
+        api_headers["X-XSRF-TOKEN"] = urllib.parse.unquote(xsrf_token)
 
+    # Пробуем все варианты запросов
+    attempts = [
+        ("POST /api/v1/chat/threads/", "https://www.olx.pl/api/v1/chat/threads/", {"ad_id": int(numeric_id), "text": message_text}),
+        ("JSON-RPC chat.createThread", "https://www.olx.pl/api/v1/chat/threads/", {"jsonrpc": "2.0", "method": "chat.createThread", "params": {"ad_id": int(numeric_id), "text": message_text}, "id": 1}),
+        ("JSON-RPC chat.sendMessage", "https://www.olx.pl/api/v1/chat/threads/", {"jsonrpc": "2.0", "method": "chat.sendMessage", "params": {"ad_id": int(numeric_id), "text": message_text}, "id": 1}),
+        ("POST /api/v1/chats/", "https://www.olx.pl/api/v1/chats/", {"ad_id": int(numeric_id), "message": message_text}),
+    ]
+
+    for name, url_target, payload in attempts:
+        try:
+            r = session.post(url_target, json=payload, headers=api_headers, timeout=15)
+            logger.info(f"{name}: {r.status_code} - {r.text[:300]}")
+            if r.status_code in (200, 201):
+                data = r.json()
+                if "error" not in data and "id" in data:
+                    result["success"] = True
+                    result["original_price"] = original_price or 0
+                    result["proposed_price"] = proposal or 0
+                    result["method"] = name
+                    return result
+        except Exception as e:
+            logger.warning(f"{name}: {e}")
+
+    result["success"] = False
+    result["error"] = "Все методы отклонены. Используйте обходной режим (только сообщение без проверки ответа)."
+    return result
+
+def send_raw_message(url: str, numeric_id: str, cookie_dict: dict, message_text: str, delay: int = DELAY_BETWEEN) -> dict:
+    """Обходной режим: только отправка, результат не проверяется."""
+    result = {"url": url, "numeric_id": numeric_id}
+
+    session = requests.Session()
+    for k, v in cookie_dict.items():
+        session.cookies.set(k, v, domain=".olx.pl")
+
+    bearer_token = cookie_dict.get("access_token")
+    if not bearer_token:
+        result["success"] = False
+        result["error"] = "Нет токена"
+        return result
+
+    time.sleep(delay)
+
+    api_headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "X-Platform": "web",
+        "Origin": "https://www.olx.pl",
+        "Referer": url,
+    }
+
+    payload = {"ad_id": int(numeric_id), "text": message_text}
     try:
-        thread_resp = session.post(thread_url, json=thread_payload, headers=api_headers, timeout=15)
-        logger.info(f"Создание чата: {thread_resp.status_code} - {thread_resp.text[:300]}")
-        if thread_resp.status_code in (200, 201):
-            result["success"] = True
-            result["original_price"] = original_price
-            result["proposed_price"] = proposal
-            return result
-        else:
-            result["success"] = False
-            result["error"] = f"Ошибка чата: {thread_resp.status_code} - {thread_resp.text[:200]}"
+        r = session.post("https://www.olx.pl/api/v1/chat/threads/", json=payload, headers=api_headers, timeout=15)
+        logger.info(f"Обходной режим: {r.status_code} - {r.text[:300]}")
+        result["success"] = True
+        result["info"] = f"Отправлено (статус {r.status_code})"
     except Exception as e:
         result["success"] = False
-        result["error"] = f"Ошибка создания чата: {e}"
+        result["error"] = str(e)
 
     return result
 
@@ -271,15 +302,17 @@ HTML_PAGE = r"""
     </div>
 
     <div class="box">
-        <h3>Текст сообщения</h3>
-        <label>Текст (отправится в чат):</label>
+        <h3>Настройки</h3>
+        <label>Текст сообщения:</label>
         <textarea id="messageText" rows="3"></textarea>
-        <button id="saveMessageBtn">Сохранить текст</button>
+        <button id="saveMessageBtn">Сохранить</button>
         <span id="msgStatus"></span>
+        <br><br>
+        <label><input type="checkbox" id="bypassCheck"> Обходной режим (отправлять без проверки ответа)</label>
     </div>
 
     <div class="box">
-        <h3>Отправить предложения</h3>
+        <h3>Отправить</h3>
         <label>Выбрать куку:</label>
         <select id="cookieSelect"><option value="">-- Загружаю список... --</option></select>
         <label>Ссылки на товары (до 20, по одной на строку):</label>
@@ -302,7 +335,7 @@ HTML_PAGE = r"""
 
     <div class="modal-overlay" id="resultsModal">
         <div class="modal" style="max-width:700px;max-height:80vh;display:flex;flex-direction:column;">
-            <h2>Результаты отправки</h2>
+            <h2>Результаты</h2>
             <div id="resultsContent" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:10px;"></div>
             <button class="btn-cancel" id="resultsClose" style="align-self:flex-end;margin-top:10px;">Закрыть</button>
         </div>
@@ -318,6 +351,7 @@ HTML_PAGE = r"""
         document.addEventListener("DOMContentLoaded", function() {
             loadCookies();
             loadMessage();
+            loadBypass();
 
             document.getElementById("addCookieBtn").addEventListener("click", function() {
                 var name = document.getElementById("cookieName").value.trim();
@@ -338,13 +372,13 @@ HTML_PAGE = r"""
 
             document.getElementById("saveMessageBtn").addEventListener("click", function() {
                 var text = document.getElementById("messageText").value;
-                var status = document.getElementById("msgStatus");
                 fetch("/api/message", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ text: text }) })
                     .then(r => r.json())
-                    .then(d => {
-                        if (d.success) { status.innerHTML = '<span class="success">Сохранено</span>'; }
-                        else { status.innerHTML = '<span class="error">Ошибка</span>'; }
-                    });
+                    .then(d => { document.getElementById("msgStatus").innerHTML = d.success ? '<span class="success">Сохранено</span>' : '<span class="error">Ошибка</span>'; });
+            });
+
+            document.getElementById("bypassCheck").addEventListener("change", function() {
+                fetch("/api/bypass", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ bypass: this.checked }) });
             });
 
             document.getElementById("sendBtn").addEventListener("click", function() {
@@ -413,7 +447,7 @@ HTML_PAGE = r"""
             var html = "";
             allResults.forEach(function(r) {
                 if (r.success) {
-                    html += '<div class="result-card success"><div class="url">' + r.url + '</div><div>💰 Цена: <span class="price">' + r.original_price + ' zł</span></div><div>📉 Предложено: <span class="price">' + r.proposed_price + ' zł</span></div><div>🆔 ID: ' + r.numeric_id + '</div><div>✅ Успешно</div></div>';
+                    html += '<div class="result-card success"><div class="url">' + r.url + '</div><div>🆔 ID: ' + r.numeric_id + '</div><div>✅ ' + (r.info || r.method || "Успешно") + '</div></div>';
                 } else {
                     html += '<div class="result-card error"><div class="url">' + r.url + '</div><div>❌ ' + (r.error || "Ошибка") + '</div></div>';
                 }
@@ -422,19 +456,19 @@ HTML_PAGE = r"""
         }
 
         function loadCookies() {
-            fetch("/api/cookies")
-                .then(r => r.json())
-                .then(list => {
-                    var select = document.getElementById("cookieSelect");
-                    select.innerHTML = '<option value="">-- Выберите куку --</option>';
-                    list.forEach(name => { var o = document.createElement("option"); o.value = name; o.textContent = name; select.appendChild(o); });
-                });
+            fetch("/api/cookies").then(r => r.json()).then(list => {
+                var s = document.getElementById("cookieSelect");
+                s.innerHTML = '<option value="">-- Выберите куку --</option>';
+                list.forEach(n => { var o = document.createElement("option"); o.value = n; o.textContent = n; s.appendChild(o); });
+            });
         }
 
         function loadMessage() {
-            fetch("/api/message")
-                .then(r => r.json())
-                .then(d => { document.getElementById("messageText").value = d.text || ""; });
+            fetch("/api/message").then(r => r.json()).then(d => { document.getElementById("messageText").value = d.text || ""; });
+        }
+
+        function loadBypass() {
+            fetch("/api/bypass").then(r => r.json()).then(d => { document.getElementById("bypassCheck").checked = d.bypass || false; });
         }
     </script>
 </body>
@@ -453,23 +487,15 @@ def health():
 def manage_cookies():
     try:
         if request.method == "GET":
-            cookies = load_cookies()
-            return jsonify(list(cookies.keys()))
-        if request.method == "POST":
-            data = request.get_json(force=True)
-            if not data:
-                return jsonify({"success": False, "error": "Пустой запрос"}), 400
-            name = data.get("name", "").strip()
-            cookie_str = data.get("cookie", "").strip()
-            if not name or not cookie_str:
-                return jsonify({"success": False, "error": "Имя и строка кук обязательны"}), 400
-            cookies = load_cookies()
-            cookies[name] = cookie_str
-            save_cookies(cookies)
-            logger.info(f"Кука '{name}' добавлена")
-            return jsonify({"success": True})
+            return jsonify(list(load_cookies().keys()))
+        data = request.get_json(force=True)
+        if not data or not data.get("name") or not data.get("cookie"):
+            return jsonify({"success": False, "error": "Имя и кука обязательны"}), 400
+        cookies = load_cookies()
+        cookies[data["name"].strip()] = data["cookie"].strip()
+        save_cookies(cookies)
+        return jsonify({"success": True})
     except Exception as e:
-        logger.error(f"Ошибка cookies: {traceback.format_exc()}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/message", methods=["GET", "POST"])
@@ -477,11 +503,20 @@ def manage_message():
     try:
         if request.method == "GET":
             return jsonify({"text": load_message_text()})
-        if request.method == "POST":
-            data = request.get_json(force=True)
-            text = (data.get("text") or "").strip()
-            save_message_text(text)
-            return jsonify({"success": True})
+        data = request.get_json(force=True)
+        save_message_text((data.get("text") or "").strip())
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/bypass", methods=["GET", "POST"])
+def manage_bypass():
+    try:
+        if request.method == "GET":
+            return jsonify({"bypass": load_bypass_mode()})
+        data = request.get_json(force=True)
+        save_bypass_mode(data.get("bypass", False))
+        return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -489,10 +524,10 @@ def manage_message():
 def propose_single():
     try:
         data = request.get_json(force=True)
-        cookie_name = data.get("cookie_name", "").strip()
-        url = data.get("url", "").strip()
-        numeric_id = data.get("numeric_id", "").strip()
-        message_text = data.get("message_text", "").strip() or load_message_text()
+        cookie_name = (data.get("cookie_name") or "").strip()
+        url = (data.get("url") or "").strip()
+        numeric_id = (data.get("numeric_id") or "").strip()
+        message_text = (data.get("message_text") or "").strip() or load_message_text()
 
         if not cookie_name or not url or not numeric_id:
             return jsonify({"success": False, "error": "Нет данных"}), 400
@@ -506,10 +541,14 @@ def propose_single():
         if not cookie_dict:
             return jsonify({"success": False, "error": "Не разобрать куку"}), 400
 
-        result = process_single_url(url, numeric_id, cookie_dict, message_text, 0)
+        if load_bypass_mode():
+            result = send_raw_message(url, numeric_id, cookie_dict, message_text, 0)
+        else:
+            result = process_single_url(url, numeric_id, cookie_dict, message_text, 0)
+
         return jsonify(result)
     except Exception as e:
-        logger.error(f"Ошибка propose_single: {traceback.format_exc()}")
+        logger.error(f"Ошибка: {traceback.format_exc()}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.errorhandler(500)
