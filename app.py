@@ -49,7 +49,6 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
     """
     if not cookie_str:
         return {}
-    # Проверяем, не JSON ли это
     stripped = cookie_str.strip()
     if stripped.startswith("[") or stripped.startswith("{"):
         try:
@@ -61,14 +60,11 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
                         result[item["name"]] = item["value"]
                 return result
             elif isinstance(data, dict):
-                # На случай, если пришёл объект {"name": "val", ...}
                 if "name" in data and "value" in data:
                     return {data["name"]: data["value"]}
-                # Или просто словарь ключ-значение
                 return data
         except Exception:
-            pass  # Если JSON не парсится, идём дальше как со строкой
-    # Обычный формат "key=val; key=val"
+            pass
     result = {}
     for item in cookie_str.split(";"):
         item = item.strip()
@@ -137,15 +133,15 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка загрузки страницы: {e}"}
 
-    # ========== ПОИСК OFFER_ID ==========
+    # ========== ПОИСК OFFER_ID (ПОДДЕРЖИВАЕТ ВСЕ ФОРМАТЫ) ==========
     offer_id = None
 
-    # 1. Из URL: ...-ID-xxxxx.html
-    match = re.search(r'/[^/]*[_-]id[_-](\w+)\.html', url, re.IGNORECASE)
+    # 1. Из URL: ...-IDxxxxx.html или ..._IDxxxxx.html (CID757-ID1aP2C1.html -> 1aP2C1)
+    match = re.search(r'/[^/]*[_-][iI][dD](\w+)\.html', url)
     if match:
         offer_id = match.group(1)
     else:
-        # 2. Числовой ID в конце URL
+        # 2. Числовой ID в конце URL (например, /oferta/123456789)
         match = re.search(r'/(\d{7,})(?:\.html)?$', url)
         if match:
             offer_id = match.group(1)
@@ -156,7 +152,7 @@ def propose_price(url: str, cookie_str: str) -> dict:
         meta_og = soup.find("meta", property="og:url")
         if meta_og and meta_og.get("content"):
             og_url = meta_og.get("content", "")
-            match = re.search(r'/[^/]*[_-]id[_-](\w+)\.html', og_url, re.IGNORECASE)
+            match = re.search(r'/[^/]*[_-][iI][dD](\w+)\.html', og_url)
             if match:
                 offer_id = match.group(1)
             else:
