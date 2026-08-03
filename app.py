@@ -23,37 +23,52 @@ UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 UPSTASH_HEADERS = {"Authorization": f"Bearer {UPSTASH_TOKEN}"} if UPSTASH_TOKEN else {}
 COOKIES_KEY = "olx_cookies"
+MESSAGE_TEXT_KEY = "message_text"
 
 MAX_URLS = 20
 MAX_WORKERS = 5
 DELAY_BETWEEN = 10
+DEFAULT_MESSAGE = "Dzień dobry, czy jest jeszcze dostępne? Pozdrawiam"
 
-def load_cookies():
+def load_data(key):
     if not UPSTASH_URL:
-        return {}
+        return None
     try:
-        resp = requests.get(f"{UPSTASH_URL}/get/{COOKIES_KEY}", headers=UPSTASH_HEADERS, timeout=10)
+        resp = requests.get(f"{UPSTASH_URL}/get/{key}", headers=UPSTASH_HEADERS, timeout=10)
         result = resp.json().get("result")
         if result:
             return json.loads(result)
-        return {}
+        return None
     except Exception as e:
-        logger.error(f"Ошибка загрузки кук: {e}")
-        return {}
+        logger.error(f"Ошибка загрузки {key}: {e}")
+        return None
 
-def save_cookies(data):
+def save_data(key, data):
     if not UPSTASH_URL:
         return
     try:
         payload = json.dumps(data, ensure_ascii=False)
         requests.post(
-            f"{UPSTASH_URL}/set/{COOKIES_KEY}",
+            f"{UPSTASH_URL}/set/{key}",
             headers=UPSTASH_HEADERS,
             data=payload.encode("utf-8"),
             timeout=10,
         )
     except Exception as e:
-        logger.error(f"Ошибка сохранения кук: {e}")
+        logger.error(f"Ошибка сохранения {key}: {e}")
+
+def load_cookies():
+    return load_data(COOKIES_KEY) or {}
+
+def save_cookies(data):
+    save_data(COOKIES_KEY, data)
+
+def load_message_text():
+    val = load_data(MESSAGE_TEXT_KEY)
+    return val if isinstance(val, str) and val.strip() else DEFAULT_MESSAGE
+
+def save_message_text(text):
+    save_data(MESSAGE_TEXT_KEY, text)
 
 def cookie_str_to_dict(cookie_str: str) -> dict:
     if not cookie_str:
@@ -114,7 +129,7 @@ def extract_bearer_token(cookie_dict: dict) -> str | None:
 def extract_device_guid(cookie_dict: dict) -> str | None:
     return cookie_dict.get("deviceGUID")
 
-def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) -> dict:
+def process_single_url(url: str, numeric_id: str, cookie_dict: dict, message_text: str, delay: int = DELAY_BETWEEN) -> dict:
     result = {"url": url, "numeric_id": numeric_id}
 
     session = requests.Session()
@@ -166,16 +181,11 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int 
 
     time.sleep(delay)
 
-    # GraphQL запрос (как сказал Клод)
-    graphql_url = "https://www.olx.pl/api/graphql"
-    graphql_payload = {
-        "query": "mutation MakeOffer($input: MakeOfferInput!) { makeOffer(input: $input) { id status chat { id } } }",
-        "variables": {
-            "input": {
-                "adId": int(numeric_id),
-                "price": int(proposal)
-            }
-        }
+    # Эндпоинт создания чата из ответов Клода ранее
+    thread_url = "https://www.olx.pl/api/v1/chat/threads/"
+    thread_payload = {
+        "ad_id": int(numeric_id),
+        "text": message_text
     }
 
     api_headers = {
@@ -191,27 +201,19 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int 
         api_headers["X-Device-Id"] = device_guid
 
     try:
-        gql_resp = session.post(graphql_url, json=graphql_payload, headers=api_headers, timeout=15)
-        logger.info(f"GraphQL ответ: {gql_resp.status_code} - {gql_resp.text[:400]}")
-
-        if gql_resp.status_code == 200:
-            resp_data = gql_resp.json()
-            if "errors" in resp_data:
-                result["success"] = False
-                result["error"] = f"GraphQL ошибка: {resp_data['errors']}"
-                return result
-            offer_data = resp_data.get("data", {}).get("makeOffer", {})
-            if offer_data.get("id"):
-                result["success"] = True
-                result["original_price"] = original_price
-                result["proposed_price"] = proposal
-                return result
-
-        result["success"] = False
-        result["error"] = f"GraphQL: {gql_resp.status_code} - {gql_resp.text[:200]}"
+        thread_resp = session.post(thread_url, json=thread_payload, headers=api_headers, timeout=15)
+        logger.info(f"Создание чата: {thread_resp.status_code} - {thread_resp.text[:300]}")
+        if thread_resp.status_code in (200, 201):
+            result["success"] = True
+            result["original_price"] = original_price
+            result["proposed_price"] = proposal
+            return result
+        else:
+            result["success"] = False
+            result["error"] = f"Ошибка чата: {thread_resp.status_code} - {thread_resp.text[:200]}"
     except Exception as e:
         result["success"] = False
-        result["error"] = f"Ошибка GraphQL: {e}"
+        result["error"] = f"Ошибка создания чата: {e}"
 
     return result
 
@@ -256,7 +258,8 @@ HTML_PAGE = r"""
     </style>
 </head>
 <body>
-    <h1>🚀 ROCKET OLX Price Proposer</h1>
+    <h1>ROCKET OLX Sender</h1>
+
     <div class="box">
         <h3>Добавить куку</h3>
         <label>Имя куки:</label>
@@ -266,15 +269,25 @@ HTML_PAGE = r"""
         <button id="addCookieBtn">Добавить</button>
         <span id="addStatus"></span>
     </div>
+
+    <div class="box">
+        <h3>Текст сообщения</h3>
+        <label>Текст (отправится в чат):</label>
+        <textarea id="messageText" rows="3"></textarea>
+        <button id="saveMessageBtn">Сохранить текст</button>
+        <span id="msgStatus"></span>
+    </div>
+
     <div class="box">
         <h3>Отправить предложения</h3>
         <label>Выбрать куку:</label>
         <select id="cookieSelect"><option value="">-- Загружаю список... --</option></select>
         <label>Ссылки на товары (до 20, по одной на строку):</label>
         <textarea id="offerUrls" rows="6" placeholder="https://www.olx.pl/d/oferta/...&#10;https://www.olx.pl/d/oferta/...&#10;..."></textarea>
-        <div class="hint">После нажатия Отправить — для каждой ссылки спросит ID.</div>
-        <button id="sendBtn">🚀 Отправить все</button>
+        <div class="hint">Для каждой ссылки спросит ID объявления.</div>
+        <button id="sendBtn">Отправить все</button>
     </div>
+
     <div class="modal-overlay" id="idModal">
         <div class="modal">
             <h2>Введите ID объявления</h2>
@@ -286,19 +299,26 @@ HTML_PAGE = r"""
             </div>
         </div>
     </div>
+
     <div class="modal-overlay" id="resultsModal">
         <div class="modal" style="max-width:700px;max-height:80vh;display:flex;flex-direction:column;">
-            <h2>📋 Результаты отправки</h2>
+            <h2>Результаты отправки</h2>
             <div id="resultsContent" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:10px;"></div>
             <button class="btn-cancel" id="resultsClose" style="align-self:flex-end;margin-top:10px;">Закрыть</button>
         </div>
     </div>
+
     <script>
         var pendingUrls = [];
         var pendingIndex = 0;
         var cookieName = "";
         var allResults = [];
+        var currentMessage = "";
+
         document.addEventListener("DOMContentLoaded", function() {
+            loadCookies();
+            loadMessage();
+
             document.getElementById("addCookieBtn").addEventListener("click", function() {
                 var name = document.getElementById("cookieName").value.trim();
                 var cookie = document.getElementById("cookieValue").value.trim();
@@ -315,23 +335,38 @@ HTML_PAGE = r"""
                     .catch(e => { status.innerHTML = '<span class="error">Ошибка: ' + e.message + '</span>'; })
                     .finally(() => { btn.disabled = false; btn.textContent = "Добавить"; });
             });
+
+            document.getElementById("saveMessageBtn").addEventListener("click", function() {
+                var text = document.getElementById("messageText").value;
+                var status = document.getElementById("msgStatus");
+                fetch("/api/message", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ text: text }) })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.success) { status.innerHTML = '<span class="success">Сохранено</span>'; }
+                        else { status.innerHTML = '<span class="error">Ошибка</span>'; }
+                    });
+            });
+
             document.getElementById("sendBtn").addEventListener("click", function() {
                 cookieName = document.getElementById("cookieSelect").value;
                 var urlsText = document.getElementById("offerUrls").value.trim();
                 if (!cookieName || !urlsText) { alert("Выберите куку и введите ссылки"); return; }
                 var urls = urlsText.split("\n").map(u => u.trim()).filter(u => u.length > 0);
                 if (urls.length === 0 || urls.length > 20) { alert("От 1 до 20 ссылок"); return; }
+                currentMessage = document.getElementById("messageText").value.trim() || "Dzień dobry, czy jest jeszcze dostępne?";
                 pendingUrls = urls;
                 pendingIndex = 0;
                 allResults = [];
                 showIdModal(pendingUrls[0]);
             });
+
             document.getElementById("idModalSubmit").addEventListener("click", function() {
                 var id = document.getElementById("idModalInput").value.trim();
                 if (!id || !/^\d+$/.test(id)) { alert("Введите числовой ID"); return; }
                 document.getElementById("idModal").classList.remove("active");
                 sendOne(pendingUrls[pendingIndex], id);
             });
+
             document.getElementById("idModalSkip").addEventListener("click", function() {
                 document.getElementById("idModal").classList.remove("active");
                 allResults.push({ url: pendingUrls[pendingIndex], success: false, error: "Пропущено" });
@@ -339,23 +374,25 @@ HTML_PAGE = r"""
                 if (pendingIndex < pendingUrls.length) { showIdModal(pendingUrls[pendingIndex]); }
                 else { showResults(); }
             });
+
             document.getElementById("resultsClose").addEventListener("click", function() {
                 document.getElementById("resultsModal").classList.remove("active");
             });
-            loadCookies();
         });
+
         function showIdModal(url) {
             document.getElementById("idModalUrl").textContent = url;
             document.getElementById("idModalInput").value = "";
             document.getElementById("idModal").classList.add("active");
         }
+
         function sendOne(url, id) {
             document.getElementById("resultsContent").innerHTML = '<div class="result-card"><div class="url">' + url + '</div><div>Отправка...</div></div>';
             document.getElementById("resultsModal").classList.add("active");
             fetch("/api/propose_single", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({ cookie_name: cookieName, url: url, numeric_id: id })
+                body: JSON.stringify({ cookie_name: cookieName, url: url, numeric_id: id, message_text: currentMessage })
             })
             .then(r => r.json())
             .then(r => {
@@ -371,6 +408,7 @@ HTML_PAGE = r"""
                 else { showResults(); }
             });
         }
+
         function showResults() {
             var html = "";
             allResults.forEach(function(r) {
@@ -382,6 +420,7 @@ HTML_PAGE = r"""
             });
             document.getElementById("resultsContent").innerHTML = html;
         }
+
         function loadCookies() {
             fetch("/api/cookies")
                 .then(r => r.json())
@@ -390,6 +429,12 @@ HTML_PAGE = r"""
                     select.innerHTML = '<option value="">-- Выберите куку --</option>';
                     list.forEach(name => { var o = document.createElement("option"); o.value = name; o.textContent = name; select.appendChild(o); });
                 });
+        }
+
+        function loadMessage() {
+            fetch("/api/message")
+                .then(r => r.json())
+                .then(d => { document.getElementById("messageText").value = d.text || ""; });
         }
     </script>
 </body>
@@ -427,6 +472,19 @@ def manage_cookies():
         logger.error(f"Ошибка cookies: {traceback.format_exc()}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/api/message", methods=["GET", "POST"])
+def manage_message():
+    try:
+        if request.method == "GET":
+            return jsonify({"text": load_message_text()})
+        if request.method == "POST":
+            data = request.get_json(force=True)
+            text = (data.get("text") or "").strip()
+            save_message_text(text)
+            return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/api/propose_single", methods=["POST"])
 def propose_single():
     try:
@@ -434,16 +492,21 @@ def propose_single():
         cookie_name = data.get("cookie_name", "").strip()
         url = data.get("url", "").strip()
         numeric_id = data.get("numeric_id", "").strip()
+        message_text = data.get("message_text", "").strip() or load_message_text()
+
         if not cookie_name or not url or not numeric_id:
             return jsonify({"success": False, "error": "Нет данных"}), 400
+
         cookies = load_cookies()
         cookie_str = cookies.get(cookie_name)
         if not cookie_str:
             return jsonify({"success": False, "error": "Кука не найдена"}), 404
+
         cookie_dict = cookie_str_to_dict(cookie_str)
         if not cookie_dict:
             return jsonify({"success": False, "error": "Не разобрать куку"}), 400
-        result = process_single_url(url, numeric_id, cookie_dict, 0)
+
+        result = process_single_url(url, numeric_id, cookie_dict, message_text, 0)
         return jsonify(result)
     except Exception as e:
         logger.error(f"Ошибка propose_single: {traceback.format_exc()}")
