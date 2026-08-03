@@ -109,25 +109,49 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка загрузки страницы: {e}"}
 
+    # ========== НОВЫЙ УНИВЕРСАЛЬНЫЙ ПОИСК OFFER_ID ==========
     offer_id = None
-    match = re.search(r"-ID-(\w+)\.html", url)
+
+    # 1. Прямой поиск в URL: -ID-xxxxxxxx.html или -id-xxxxxxxx.html (регистронезависимо)
+    match = re.search(r'/[^/]*[_-]id[_-](\w+)\.html', url, re.IGNORECASE)
     if match:
         offer_id = match.group(1)
     else:
+        # 2. Ищем в URL числовой ID в конце (например, /oferta/123456789)
+        match = re.search(r'/(\d{7,})(?:\.html)?$', url)
+        if match:
+            offer_id = match.group(1)
+
+    # 3. Если не нашли, ищем в og:url на странице
+    if not offer_id:
         soup = BeautifulSoup(html, "html.parser")
         meta_og = soup.find("meta", property="og:url")
-        if meta_og:
+        if meta_og and meta_og.get("content"):
             og_url = meta_og.get("content", "")
-            match = re.search(r"-ID-(\w+)\.html", og_url)
+            match = re.search(r'/[^/]*[_-]id[_-](\w+)\.html', og_url, re.IGNORECASE)
             if match:
                 offer_id = match.group(1)
-        if not offer_id:
-            match = re.search(r'"ad_id":"?(\d+)"?', html)
-            if match:
-                offer_id = match.group(1)
-    if not offer_id:
-        return {"success": False, "error": "Не удалось извлечь ID объявления"}
+            else:
+                match = re.search(r'/(\d{7,})(?:\.html)?$', og_url)
+                if match:
+                    offer_id = match.group(1)
 
+    # 4. Пробуем достать из window.__INITIAL_STATE__ или другого JSON на странице
+    if not offer_id:
+        match = re.search(r'"ad_id"\s*:\s*"?(\d+)"?', html)
+        if match:
+            offer_id = match.group(1)
+
+    # 5. Ищем в микроразметке (data-offerid)
+    if not offer_id:
+        match = re.search(r'data-offerid\s*=\s*["\'](\d+)["\']', html)
+        if match:
+            offer_id = match.group(1)
+
+    if not offer_id:
+        return {"success": False, "error": "Не удалось извлечь ID объявления. Проверьте ссылку."}
+
+    # ========== ДАЛЕЕ ВСЁ БЕЗ ИЗМЕНЕНИЙ ==========
     original_price = extract_price(html)
     if original_price is None:
         return {"success": False, "error": "Не удалось определить цену на странице"}
