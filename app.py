@@ -127,6 +127,57 @@ def check_negotiation(html: str) -> bool:
         return True
     return False
 
+def get_or_create_thread(session, numeric_id, bearer_token):
+    """Пытается найти существующий чат или создать новый."""
+    api_headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    # 1. Попробовать найти существующий чат
+    try:
+        resp = session.get(
+            f"https://www.olx.pl/api/v1/chat/threads/",
+            params={"ad_id": int(numeric_id)},
+            headers=api_headers,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                thread_id = data[0].get("id")
+                if thread_id:
+                    logger.info(f"Найден существующий чат: {thread_id}")
+                    return thread_id
+            elif isinstance(data, dict):
+                thread_id = data.get("id") or (data.get("data", {}) if isinstance(data.get("data"), dict) else {}).get("id")
+                if thread_id:
+                    logger.info(f"Найден существующий чат (dict): {thread_id}")
+                    return thread_id
+    except Exception as e:
+        logger.warning(f"Ошибка поиска чата: {e}")
+
+    # 2. Создать новый чат
+    try:
+        resp = session.post(
+            "https://www.olx.pl/api/v1/chat/threads/",
+            json={"ad_id": int(numeric_id), "text": ""},
+            headers=api_headers,
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            thread_id = data.get("id") or (data.get("data", {}) if isinstance(data.get("data"), dict) else {}).get("id")
+            if thread_id:
+                logger.info(f"Создан новый чат: {thread_id}")
+                return thread_id
+        logger.error(f"Создание чата: {resp.status_code} - {resp.text[:200]}")
+    except Exception as e:
+        logger.error(f"Ошибка создания чата: {e}")
+
+    return None
+
 def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) -> dict:
     result = {"url": url, "numeric_id": numeric_id}
 
@@ -185,30 +236,12 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int 
         xsrf_token = urllib.parse.unquote(xsrf_token)
         session.headers.update({"X-XSRF-TOKEN": xsrf_token})
 
-    session.headers.update({
-        "Authorization": f"Bearer {bearer_token}",
-        "Content-Type": "application/json",
-    })
-
     time.sleep(delay)
 
-    thread_url = "https://www.olx.pl/api/v1/chat/threads/"
-    thread_payload = {"ad_id": int(numeric_id), "text": ""}
-    try:
-        thread_resp = session.post(thread_url, json=thread_payload, timeout=15)
-        if thread_resp.status_code not in (200, 201):
-            result["success"] = False
-            result["error"] = f"Ошибка чата: {thread_resp.status_code}"
-            return result
-        thread_data = thread_resp.json()
-        thread_id = thread_data.get("id") or thread_data.get("data", {}).get("id")
-        if not thread_id:
-            result["success"] = False
-            result["error"] = "Не получен ID чата"
-            return result
-    except Exception as e:
+    thread_id = get_or_create_thread(session, numeric_id, bearer_token)
+    if not thread_id:
         result["success"] = False
-        result["error"] = f"Ошибка создания чата: {e}"
+        result["error"] = "Не удалось найти или создать чат"
         return result
 
     message_url = f"https://www.olx.pl/api/v1/chat/threads/{thread_id}/messages/"
@@ -225,7 +258,7 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int 
             result["proposed_price"] = proposal
         else:
             result["success"] = False
-            result["error"] = f"Ошибка отправки: {msg_resp.status_code}"
+            result["error"] = f"Ошибка отправки: {msg_resp.status_code} - {msg_resp.text[:200]}"
     except Exception as e:
         result["success"] = False
         result["error"] = f"Ошибка сообщения: {e}"
