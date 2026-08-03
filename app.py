@@ -109,9 +109,12 @@ def extract_price(html: str) -> int | None:
         return None
 
 def extract_bearer_token(html: str, cookie_dict: dict) -> str | None:
+    # 1. Из кук (самый надёжный)
     token = cookie_dict.get("access_token")
     if token:
+        logger.info("Bearer токен из кук (access_token)")
         return token
+    # 2. Из HTML
     match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', html)
     if match:
         return match.group(1)
@@ -121,24 +124,39 @@ def extract_bearer_token(html: str, cookie_dict: dict) -> str | None:
     return None
 
 def check_negotiation(html: str) -> bool:
+    """Проверяет возможность торга по Клоду: data-testid + negotiable флаг + текст кнопки"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. Кнопка по data-testid (самый надёжный)
+    btn = soup.find("button", attrs={"data-testid": "make-an-offer-button"})
+    if btn:
+        logger.info("Найдена кнопка make-an-offer-button")
+        return True
+
+    # 2. Флаг negotiable в __INITIAL_STATE__
     if re.search(r'"negotiable"\s*:\s*true', html):
+        logger.info("Флаг negotiable: true")
         return True
+
+    # 3. Текст кнопки (запасной)
     if "Negocjuj cenę" in html or "Предложить цену" in html:
+        logger.info("Текст Negocjuj cenę найден")
         return True
+
     return False
 
 def get_or_create_thread(session, numeric_id, bearer_token):
-    """Пытается найти существующий чат или создать новый."""
+    """Сначала ищет существующий чат, если нет — создаёт новый."""
     api_headers = {
         "Authorization": f"Bearer {bearer_token}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
-    # 1. Попробовать найти существующий чат
+    # 1. Поиск существующего чата
     try:
         resp = session.get(
-            f"https://www.olx.pl/api/v1/chat/threads/",
+            "https://www.olx.pl/api/v1/chat/threads/",
             params={"ad_id": int(numeric_id)},
             headers=api_headers,
             timeout=15,
@@ -146,19 +164,18 @@ def get_or_create_thread(session, numeric_id, bearer_token):
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, list) and len(data) > 0:
-                thread_id = data[0].get("id")
-                if thread_id:
-                    logger.info(f"Найден существующий чат: {thread_id}")
-                    return thread_id
+                tid = data[0].get("id")
+                if tid:
+                    logger.info(f"Найден чат: {tid}")
+                    return tid
             elif isinstance(data, dict):
-                thread_id = data.get("id") or (data.get("data", {}) if isinstance(data.get("data"), dict) else {}).get("id")
-                if thread_id:
-                    logger.info(f"Найден существующий чат (dict): {thread_id}")
-                    return thread_id
+                tid = data.get("id")
+                if tid:
+                    return tid
     except Exception as e:
         logger.warning(f"Ошибка поиска чата: {e}")
 
-    # 2. Создать новый чат
+    # 2. Создание нового
     try:
         resp = session.post(
             "https://www.olx.pl/api/v1/chat/threads/",
@@ -166,13 +183,13 @@ def get_or_create_thread(session, numeric_id, bearer_token):
             headers=api_headers,
             timeout=15,
         )
+        logger.info(f"Создание чата: статус {resp.status_code}, ответ: {resp.text[:300]}")
         if resp.status_code in (200, 201):
             data = resp.json()
-            thread_id = data.get("id") or (data.get("data", {}) if isinstance(data.get("data"), dict) else {}).get("id")
-            if thread_id:
-                logger.info(f"Создан новый чат: {thread_id}")
-                return thread_id
-        logger.error(f"Создание чата: {resp.status_code} - {resp.text[:200]}")
+            tid = data.get("id") or (data.get("data", {}) or {}).get("id")
+            if tid:
+                logger.info(f"Чат создан: {tid}")
+                return tid
     except Exception as e:
         logger.error(f"Ошибка создания чата: {e}")
 
@@ -225,10 +242,11 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int 
         proposal = original_price - 20
     proposal = max(proposal, 1)
 
+    # Bearer токен ПЕРВЫМ ДЕЛОМ из кук
     bearer_token = extract_bearer_token(html, cookie_dict)
     if not bearer_token:
         result["success"] = False
-        result["error"] = "Не найден Bearer токен"
+        result["error"] = "Не найден Bearer токен в куках"
         return result
 
     xsrf_token = session.cookies.get("XSRF-TOKEN", domain=".olx.pl")
@@ -258,7 +276,7 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int 
             result["proposed_price"] = proposal
         else:
             result["success"] = False
-            result["error"] = f"Ошибка отправки: {msg_resp.status_code} - {msg_resp.text[:200]}"
+            result["error"] = f"Ошибка отправки: {msg_resp.status_code}"
     except Exception as e:
         result["success"] = False
         result["error"] = f"Ошибка сообщения: {e}"
@@ -306,8 +324,7 @@ HTML_PAGE = r"""
     </style>
 </head>
 <body>
-    <h1>🚀 ROCKET OLX Price Proposer</h1>
-
+    <h1>ROCKET OLX Price Proposer</h1>
     <div class="box">
         <h3>Добавить куку</h3>
         <label>Имя куки:</label>
@@ -317,7 +334,6 @@ HTML_PAGE = r"""
         <button id="addCookieBtn">Добавить</button>
         <span id="addStatus"></span>
     </div>
-
     <div class="box">
         <h3>Отправить предложения</h3>
         <label>Выбрать куку:</label>
@@ -325,9 +341,8 @@ HTML_PAGE = r"""
         <label>Ссылки на товары (до 20, по одной на строку):</label>
         <textarea id="offerUrls" rows="6" placeholder="https://www.olx.pl/d/oferta/...&#10;https://www.olx.pl/d/oferta/...&#10;..."></textarea>
         <div class="hint">После нажатия Отправить — для каждой ссылки спросит ID.</div>
-        <button id="sendBtn">🚀 Отправить все</button>
+        <button id="sendBtn">Отправить все</button>
     </div>
-
     <div class="modal-overlay" id="idModal">
         <div class="modal">
             <h2>Введите ID объявления</h2>
@@ -339,21 +354,18 @@ HTML_PAGE = r"""
             </div>
         </div>
     </div>
-
     <div class="modal-overlay" id="resultsModal">
         <div class="modal" style="max-width:700px;max-height:80vh;display:flex;flex-direction:column;">
-            <h2>📋 Результаты отправки</h2>
+            <h2>Результаты отправки</h2>
             <div id="resultsContent" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:10px;"></div>
             <button class="btn-cancel" id="resultsClose" style="align-self:flex-end;margin-top:10px;">Закрыть</button>
         </div>
     </div>
-
     <script>
         var pendingUrls = [];
         var pendingIndex = 0;
         var cookieName = "";
         var allResults = [];
-
         document.addEventListener("DOMContentLoaded", function() {
             document.getElementById("addCookieBtn").addEventListener("click", function() {
                 var name = document.getElementById("cookieName").value.trim();
@@ -366,12 +378,11 @@ HTML_PAGE = r"""
                     .then(r => r.json())
                     .then(d => {
                         if (d.success) { status.innerHTML = '<span class="success">Кука добавлена!</span>'; document.getElementById("cookieName").value = ""; document.getElementById("cookieValue").value = ""; loadCookies(); }
-                        else { status.innerHTML = '<span class="error">Ошибка: ' + (d.error || "Неизвестная") + '</span>'; }
+                        else { status.innerHTML = '<span class="error">Ошибка: ' + (d.error || "") + '</span>'; }
                     })
                     .catch(e => { status.innerHTML = '<span class="error">Ошибка: ' + e.message + '</span>'; })
                     .finally(() => { btn.disabled = false; btn.textContent = "Добавить"; });
             });
-
             document.getElementById("sendBtn").addEventListener("click", function() {
                 cookieName = document.getElementById("cookieSelect").value;
                 var urlsText = document.getElementById("offerUrls").value.trim();
@@ -383,40 +394,32 @@ HTML_PAGE = r"""
                 allResults = [];
                 showIdModal(pendingUrls[0]);
             });
-
             document.getElementById("idModalSubmit").addEventListener("click", function() {
                 var id = document.getElementById("idModalInput").value.trim();
                 if (!id || !/^\d+$/.test(id)) { alert("Введите числовой ID"); return; }
                 document.getElementById("idModal").classList.remove("active");
                 sendOne(pendingUrls[pendingIndex], id);
             });
-
             document.getElementById("idModalSkip").addEventListener("click", function() {
                 document.getElementById("idModal").classList.remove("active");
-                allResults.push({ url: pendingUrls[pendingIndex], success: false, error: "Пропущено пользователем" });
+                allResults.push({ url: pendingUrls[pendingIndex], success: false, error: "Пропущено" });
                 pendingIndex++;
                 if (pendingIndex < pendingUrls.length) { showIdModal(pendingUrls[pendingIndex]); }
                 else { showResults(); }
             });
-
             document.getElementById("resultsClose").addEventListener("click", function() {
                 document.getElementById("resultsModal").classList.remove("active");
             });
-
             loadCookies();
         });
-
         function showIdModal(url) {
             document.getElementById("idModalUrl").textContent = url;
             document.getElementById("idModalInput").value = "";
             document.getElementById("idModal").classList.add("active");
         }
-
         function sendOne(url, id) {
-            var resultsDiv = document.getElementById("resultsContent");
-            resultsDiv.innerHTML = '<div class="result-card"><div class="url">' + url + '</div><div>⏳ Отправка...</div></div>';
+            document.getElementById("resultsContent").innerHTML = '<div class="result-card"><div class="url">' + url + '</div><div>Отправка...</div></div>';
             document.getElementById("resultsModal").classList.add("active");
-
             fetch("/api/propose_single", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
@@ -426,11 +429,8 @@ HTML_PAGE = r"""
             .then(r => {
                 allResults.push(r);
                 pendingIndex++;
-                if (pendingIndex < pendingUrls.length) {
-                    showIdModal(pendingUrls[pendingIndex]);
-                } else {
-                    showResults();
-                }
+                if (pendingIndex < pendingUrls.length) { showIdModal(pendingUrls[pendingIndex]); }
+                else { showResults(); }
             })
             .catch(e => {
                 allResults.push({ url: url, success: false, error: e.message });
@@ -439,19 +439,17 @@ HTML_PAGE = r"""
                 else { showResults(); }
             });
         }
-
         function showResults() {
             var html = "";
             allResults.forEach(function(r) {
                 if (r.success) {
-                    html += '<div class="result-card success"><div class="url">🔗 ' + r.url + '</div><div>💰 Оригинальная цена: <span class="price">' + r.original_price + ' zł</span></div><div>📉 Предложено: <span class="price">' + r.proposed_price + ' zł</span></div><div>🆔 ID: ' + r.numeric_id + '</div><div>✅ Успешно</div></div>';
+                    html += '<div class="result-card success"><div class="url">' + r.url + '</div><div>💰 Цена: <span class="price">' + r.original_price + ' zł</span></div><div>📉 Предложено: <span class="price">' + r.proposed_price + ' zł</span></div><div>🆔 ID: ' + r.numeric_id + '</div><div>✅ Успешно</div></div>';
                 } else {
-                    html += '<div class="result-card error"><div class="url">🔗 ' + r.url + '</div><div>❌ ' + (r.error || "Ошибка") + '</div></div>';
+                    html += '<div class="result-card error"><div class="url">' + r.url + '</div><div>❌ ' + (r.error || "Ошибка") + '</div></div>';
                 }
             });
             document.getElementById("resultsContent").innerHTML = html;
         }
-
         function loadCookies() {
             fetch("/api/cookies")
                 .then(r => r.json())
@@ -504,19 +502,15 @@ def propose_single():
         cookie_name = data.get("cookie_name", "").strip()
         url = data.get("url", "").strip()
         numeric_id = data.get("numeric_id", "").strip()
-
         if not cookie_name or not url or not numeric_id:
             return jsonify({"success": False, "error": "Нет данных"}), 400
-
         cookies = load_cookies()
         cookie_str = cookies.get(cookie_name)
         if not cookie_str:
             return jsonify({"success": False, "error": "Кука не найдена"}), 404
-
         cookie_dict = cookie_str_to_dict(cookie_str)
         if not cookie_dict:
             return jsonify({"success": False, "error": "Не разобрать куку"}), 400
-
         result = process_single_url(url, numeric_id, cookie_dict, 0)
         return jsonify(result)
     except Exception as e:
