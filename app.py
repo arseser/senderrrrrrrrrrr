@@ -3,13 +3,12 @@ import re
 import logging
 import os
 import traceback
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, request, jsonify
 import requests
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
-# Логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -19,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 COOKIES_FILE = "cookies.json"
 
-# При запуске создаём файл кук, если его нет
 if not os.path.exists(COOKIES_FILE):
     with open(COOKIES_FILE, "w", encoding="utf-8") as f:
         json.dump({}, f)
@@ -172,11 +170,116 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка отправки предложения: {e}"}
 
-# ========== Маршруты ==========
+# ========== HTML-страница прямо в коде ==========
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <title>ROCKET OLX Sender</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }
+        h1 { color: #2c3e50; }
+        label { display: block; margin-top: 10px; font-weight: bold; }
+        input[type="text"], textarea { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }
+        button { padding: 10px 20px; margin-top: 10px; background: #27ae60; color: white; border: none; cursor: pointer; }
+        button:hover { background: #219150; }
+        .box { border: 1px solid #ccc; padding: 15px; margin: 20px 0; border-radius: 6px; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>🚀 ROCKET OLX Price Proposer</h1>
+
+    <div class="box">
+        <h3>Добавить куку</h3>
+        <label>Имя куки:</label>
+        <input type="text" id="cookieName" placeholder="Например: main">
+        <label>Строка кук (из браузера):</label>
+        <textarea id="cookieValue" rows="3" placeholder="sessionid=...; csrftoken=...;"></textarea>
+        <button onclick="addCookie()">Добавить</button>
+        <span id="addStatus"></span>
+    </div>
+
+    <div class="box">
+        <h3>Отправить предложение</h3>
+        <label>Выбрать куку:</label>
+        <select id="cookieSelect">
+            <option value="">-- Загружаю список... --</option>
+        </select>
+        <label>Ссылка на товар OLX:</label>
+        <input type="text" id="offerUrl" placeholder="https://www.olx.pl/d/oferta/...">
+        <button onclick="sendProposal()">Отправить предложение</button>
+        <pre id="resultBox"></pre>
+    </div>
+
+    <script>
+        async function loadCookies() {
+            const resp = await fetch('/api/cookies');
+            const list = await resp.json();
+            const select = document.getElementById('cookieSelect');
+            select.innerHTML = '<option value="">-- Выберите куку --</option>';
+            list.forEach(name => {
+                const opt = document.createElement('option');
+                opt.value = name;
+                opt.textContent = name;
+                select.appendChild(opt);
+            });
+        }
+        loadCookies();
+
+        async function addCookie() {
+            const name = document.getElementById('cookieName').value.trim();
+            const cookie = document.getElementById('cookieValue').value.trim();
+            const status = document.getElementById('addStatus');
+            if (!name || !cookie) {
+                status.innerHTML = '<span class="error">Заполните оба поля</span>';
+                return;
+            }
+            const resp = await fetch('/api/cookies', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, cookie })
+            });
+            const data = await resp.json();
+            if (data.success) {
+                status.innerHTML = '<span class="success">Кука добавлена!</span>';
+                loadCookies();
+                document.getElementById('cookieName').value = '';
+                document.getElementById('cookieValue').value = '';
+            } else {
+                status.innerHTML = `<span class="error">Ошибка: ${data.error}</span>`;
+            }
+        }
+
+        async function sendProposal() {
+            const cookie_name = document.getElementById('cookieSelect').value;
+            const url = document.getElementById('offerUrl').value.trim();
+            const resultBox = document.getElementById('resultBox');
+            resultBox.textContent = '⏳ Отправка...';
+            if (!cookie_name || !url) {
+                resultBox.textContent = '❌ Выберите куку и укажите ссылку';
+                return;
+            }
+            const resp = await fetch('/api/propose', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ cookie_name, url })
+            });
+            const data = await resp.json();
+            if (data.success) {
+                resultBox.textContent = `✅ Предложение отправлено!\\nОригинальная цена: ${data.original_price} zł\\nПредложено: ${data.proposed_price} zł\\nСсылка: ${data.url}`;
+            } else {
+                resultBox.textContent = `❌ Ошибка: ${data.error}`;
+            }
+        }
+    </script>
+</body>
+</html>"""
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return HTML_PAGE
 
 @app.route("/health")
 def health():
@@ -199,7 +302,6 @@ def manage_cookies():
             save_cookies(cookies)
             return jsonify({"success": True})
     except Exception as e:
-        # ВАЖНО: выводим полный трейсбек
         err = traceback.format_exc()
         logger.error(err)
         return jsonify({"success": False, "error": f"Исключение: {err}"}), 500
