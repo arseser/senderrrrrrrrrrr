@@ -84,75 +84,6 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
             result[k.strip()] = v.strip()
     return result
 
-def extract_numeric_id(html: str, url: str = "") -> str | None:
-    """
-    Приоритеты:
-    1. window.__INITIAL_STATE__
-    2. ID: число
-    3. "id":число,"title"
-    4. al:android:url
-    5. "id": 7+ цифр
-    6. Из URL (только если 7+ цифр после очистки)
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1. __INITIAL_STATE__
-    script_tag = soup.find("script", string=re.compile(r'window\.__INITIAL_STATE__'))
-    if script_tag and script_tag.string:
-        json_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', script_tag.string)
-        if json_match:
-            try:
-                data = json.loads(json_match.group(1))
-                ad_id = data.get("ad", {}).get("currentAd", {}).get("id")
-                if ad_id:
-                    logger.info(f"ID из __INITIAL_STATE__: {ad_id}")
-                    return str(ad_id)
-            except Exception:
-                pass
-
-    # 2. ID: число
-    match = re.search(r'ID:\s*(\d{7,})', html)
-    if match:
-        logger.info(f"ID из ID: {match.group(1)}")
-        return match.group(1)
-
-    # 3. "id":число,"title"
-    match = re.search(r'"id"\s*:\s*(\d+)\s*,\s*"title"', html)
-    if match:
-        logger.info(f"ID из regex id+title: {match.group(1)}")
-        return match.group(1)
-
-    # 4. al:android:url
-    meta = soup.find("meta", property="al:android:url")
-    if meta and meta.get("content"):
-        match = re.search(r'item/(\d+)', meta["content"])
-        if match:
-            logger.info(f"ID из al:android:url: {match.group(1)}")
-            return match.group(1)
-
-    # 5. "id": 7+ цифр
-    match = re.search(r'"id"\s*:\s*(\d{7,})', html)
-    if match:
-        logger.info(f"ID из regex 7+ цифр: {match.group(1)}")
-        return match.group(1)
-
-    # 6. Из URL (только если получается 7+ цифр)
-    if url:
-        match = re.search(r'-ID([a-zA-Z0-9]+)\.html', url)
-        if match:
-            raw_id = match.group(1)
-            numeric_id = re.sub(r'\D', '', raw_id)
-            if numeric_id and len(numeric_id) >= 7:
-                logger.info(f"ID из URL: {numeric_id}")
-                return numeric_id
-        # Ещё вариант: /oferta/123456789
-        match = re.search(r'/(\d{7,})(?:\.html|$|\?)', url)
-        if match:
-            logger.info(f"ID из URL (число): {match.group(1)}")
-            return match.group(1)
-
-    return None
-
 def extract_price(html: str) -> int | None:
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -196,8 +127,8 @@ def check_negotiation(html: str) -> bool:
         return True
     return False
 
-def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) -> dict:
-    result = {"url": url}
+def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) -> dict:
+    result = {"url": url, "numeric_id": numeric_id}
 
     session = requests.Session()
     try:
@@ -224,16 +155,9 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
         result["error"] = f"Ошибка загрузки: {e}"
         return result
 
-    numeric_id = extract_numeric_id(html, url)
-    if not numeric_id:
-        result["success"] = False
-        result["error"] = "Не удалось найти числовой ID"
-        return result
-    result["numeric_id"] = numeric_id
-
     if not check_negotiation(html):
         result["success"] = False
-        result["error"] = "Нет кнопки предложения цены"
+        result["error"] = "Нет кнопки Negocjuj cenę"
         return result
 
     original_price = extract_price(html)
@@ -330,22 +254,27 @@ HTML_PAGE = r"""
         .hint { font-size: 12px; color: #888; margin-top: 4px; }
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1000; justify-content: center; align-items: center; }
         .modal-overlay.active { display: flex; }
-        .modal { background: white; border-radius: 12px; padding: 30px; width: 90%; max-width: 700px; max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 10px 40px rgba(0,0,0,0.3); }
+        .modal { background: white; border-radius: 12px; padding: 30px; width: 90%; max-width: 500px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); }
         .modal h2 { margin-bottom: 15px; color: #2c3e50; }
-        .modal-results { overflow-y: auto; flex: 1; margin-bottom: 15px; display: flex; flex-direction: column; gap: 10px; }
+        .modal input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+        .modal-buttons { display: flex; gap: 10px; margin-top: 15px; justify-content: flex-end; }
+        .modal-buttons button { padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+        .btn-primary { background: #27ae60; color: white; }
+        .btn-primary:hover { background: #219150; }
+        .btn-cancel { background: #95a5a6; color: white; }
+        .btn-cancel:hover { background: #7f8c8d; }
         .result-card { border: 1px solid #ddd; border-radius: 8px; padding: 12px 15px; font-size: 13px; line-height: 1.5; }
         .result-card.success { border-left: 4px solid #27ae60; background: #f0faf4; }
         .result-card.error { border-left: 4px solid #e74c3c; background: #fef5f5; }
         .result-card .url { font-size: 11px; color: #666; word-break: break-all; margin-bottom: 5px; }
         .result-card .price { font-weight: bold; }
-        .modal-close { padding: 10px 20px; background: #3498db; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; align-self: flex-end; }
-        .modal-close:hover { background: #2980b9; }
         .spinner { display: inline-block; width: 16px; height: 16px; border: 3px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 8px; vertical-align: middle; }
         @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
     <h1>🚀 ROCKET OLX Price Proposer</h1>
+
     <div class="box">
         <h3>Добавить куку</h3>
         <label>Имя куки:</label>
@@ -355,24 +284,43 @@ HTML_PAGE = r"""
         <button id="addCookieBtn">Добавить</button>
         <span id="addStatus"></span>
     </div>
+
     <div class="box">
         <h3>Отправить предложения</h3>
         <label>Выбрать куку:</label>
         <select id="cookieSelect"><option value="">-- Загружаю список... --</option></select>
         <label>Ссылки на товары (до 20, по одной на строку):</label>
         <textarea id="offerUrls" rows="6" placeholder="https://www.olx.pl/d/oferta/...&#10;https://www.olx.pl/d/oferta/...&#10;..."></textarea>
-        <div class="hint">Максимум 20 ссылок. Задержка 10 сек между отправками.</div>
+        <div class="hint">После нажатия Отправить — для каждой ссылки спросит ID.</div>
         <button id="sendBtn">🚀 Отправить все</button>
     </div>
-    <div class="modal-overlay" id="modalOverlay">
+
+    <div class="modal-overlay" id="idModal">
         <div class="modal">
-            <h2>📋 Результаты отправки</h2>
-            <div class="modal-results" id="modalResults"></div>
-            <button class="modal-close" id="modalCloseBtn">Закрыть</button>
+            <h2>Введите ID объявления</h2>
+            <p style="font-size:12px;color:#888;margin-bottom:10px;" id="idModalUrl"></p>
+            <input type="text" id="idModalInput" placeholder="Например: 1084063708">
+            <div class="modal-buttons">
+                <button class="btn-cancel" id="idModalSkip">Пропустить</button>
+                <button class="btn-primary" id="idModalSubmit">Отправить</button>
+            </div>
         </div>
     </div>
+
+    <div class="modal-overlay" id="resultsModal">
+        <div class="modal" style="max-width:700px;max-height:80vh;display:flex;flex-direction:column;">
+            <h2>📋 Результаты отправки</h2>
+            <div id="resultsContent" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:10px;"></div>
+            <button class="btn-cancel" id="resultsClose" style="align-self:flex-end;margin-top:10px;">Закрыть</button>
+        </div>
+    </div>
+
     <script>
-        console.log("Скрипт загружен");
+        var pendingUrls = [];
+        var pendingIndex = 0;
+        var cookieName = "";
+        var allResults = [];
+
         document.addEventListener("DOMContentLoaded", function() {
             document.getElementById("addCookieBtn").addEventListener("click", function() {
                 var name = document.getElementById("cookieName").value.trim();
@@ -390,41 +338,87 @@ HTML_PAGE = r"""
                     .catch(e => { status.innerHTML = '<span class="error">Ошибка: ' + e.message + '</span>'; })
                     .finally(() => { btn.disabled = false; btn.textContent = "Добавить"; });
             });
+
             document.getElementById("sendBtn").addEventListener("click", function() {
-                var cookie_name = document.getElementById("cookieSelect").value;
+                cookieName = document.getElementById("cookieSelect").value;
                 var urlsText = document.getElementById("offerUrls").value.trim();
-                if (!cookie_name || !urlsText) { alert("Выберите куку и введите ссылки"); return; }
+                if (!cookieName || !urlsText) { alert("Выберите куку и введите ссылки"); return; }
                 var urls = urlsText.split("\n").map(u => u.trim()).filter(u => u.length > 0);
                 if (urls.length === 0 || urls.length > 20) { alert("От 1 до 20 ссылок"); return; }
-                var sendBtn = document.getElementById("sendBtn");
-                sendBtn.disabled = true; sendBtn.innerHTML = '<span class="spinner"></span>Отправка...';
-                var overlay = document.getElementById("modalOverlay");
-                var results = document.getElementById("modalResults");
-                results.innerHTML = urls.map((u, i) => '<div class="result-card" id="card-' + i + '"><div class="url">' + u + '</div><div>Ожидание...</div></div>').join("");
-                overlay.classList.add("active");
-                fetch("/api/propose_batch", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ cookie_name: cookie_name, urls: urls }) })
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.results) {
-                            data.results.forEach((r, i) => {
-                                var card = document.getElementById("card-" + i);
-                                if (!card) return;
-                                if (r.success) {
-                                    card.className = "result-card success";
-                                    card.innerHTML = '<div class="url">🔗 ' + r.url + '</div><div>💰 Оригинальная цена: <span class="price">' + r.original_price + ' zł</span></div><div>📉 Предложено: <span class="price">' + r.proposed_price + ' zł</span></div><div>🆔 ID: ' + r.numeric_id + '</div><div>✅ Успешно</div>';
-                                } else {
-                                    card.className = "result-card error";
-                                    card.innerHTML = '<div class="url">🔗 ' + r.url + '</div><div>❌ ' + r.error + '</div>' + (r.numeric_id ? '<div>🆔 ID: ' + r.numeric_id + '</div>' : "");
-                                }
-                            });
-                        }
-                    })
-                    .catch(e => { results.innerHTML = '<div class="result-card error">Ошибка: ' + e.message + '</div>'; })
-                    .finally(() => { sendBtn.disabled = false; sendBtn.innerHTML = "🚀 Отправить все"; });
+                pendingUrls = urls;
+                pendingIndex = 0;
+                allResults = [];
+                showIdModal(pendingUrls[0]);
             });
-            document.getElementById("modalCloseBtn").addEventListener("click", function() { document.getElementById("modalOverlay").classList.remove("active"); });
+
+            document.getElementById("idModalSubmit").addEventListener("click", function() {
+                var id = document.getElementById("idModalInput").value.trim();
+                if (!id || !/^\d+$/.test(id)) { alert("Введите числовой ID"); return; }
+                document.getElementById("idModal").classList.remove("active");
+                sendOne(pendingUrls[pendingIndex], id);
+            });
+
+            document.getElementById("idModalSkip").addEventListener("click", function() {
+                document.getElementById("idModal").classList.remove("active");
+                allResults.push({ url: pendingUrls[pendingIndex], success: false, error: "Пропущено пользователем" });
+                pendingIndex++;
+                if (pendingIndex < pendingUrls.length) { showIdModal(pendingUrls[pendingIndex]); }
+                else { showResults(); }
+            });
+
+            document.getElementById("resultsClose").addEventListener("click", function() {
+                document.getElementById("resultsModal").classList.remove("active");
+            });
+
             loadCookies();
         });
+
+        function showIdModal(url) {
+            document.getElementById("idModalUrl").textContent = url;
+            document.getElementById("idModalInput").value = "";
+            document.getElementById("idModal").classList.add("active");
+        }
+
+        function sendOne(url, id) {
+            var resultsDiv = document.getElementById("resultsContent");
+            resultsDiv.innerHTML = '<div class="result-card"><div class="url">' + url + '</div><div>⏳ Отправка...</div></div>';
+            document.getElementById("resultsModal").classList.add("active");
+
+            fetch("/api/propose_single", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ cookie_name: cookieName, url: url, numeric_id: id })
+            })
+            .then(r => r.json())
+            .then(r => {
+                allResults.push(r);
+                pendingIndex++;
+                if (pendingIndex < pendingUrls.length) {
+                    showIdModal(pendingUrls[pendingIndex]);
+                } else {
+                    showResults();
+                }
+            })
+            .catch(e => {
+                allResults.push({ url: url, success: false, error: e.message });
+                pendingIndex++;
+                if (pendingIndex < pendingUrls.length) { showIdModal(pendingUrls[pendingIndex]); }
+                else { showResults(); }
+            });
+        }
+
+        function showResults() {
+            var html = "";
+            allResults.forEach(function(r) {
+                if (r.success) {
+                    html += '<div class="result-card success"><div class="url">🔗 ' + r.url + '</div><div>💰 Оригинальная цена: <span class="price">' + r.original_price + ' zł</span></div><div>📉 Предложено: <span class="price">' + r.proposed_price + ' zł</span></div><div>🆔 ID: ' + r.numeric_id + '</div><div>✅ Успешно</div></div>';
+                } else {
+                    html += '<div class="result-card error"><div class="url">🔗 ' + r.url + '</div><div>❌ ' + (r.error || "Ошибка") + '</div></div>';
+                }
+            });
+            document.getElementById("resultsContent").innerHTML = html;
+        }
+
         function loadCookies() {
             fetch("/api/cookies")
                 .then(r => r.json())
@@ -470,16 +464,16 @@ def manage_cookies():
         logger.error(f"Ошибка cookies: {traceback.format_exc()}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-@app.route("/api/propose_batch", methods=["POST"])
-def propose_batch():
+@app.route("/api/propose_single", methods=["POST"])
+def propose_single():
     try:
         data = request.get_json(force=True)
         cookie_name = data.get("cookie_name", "").strip()
-        urls = data.get("urls", [])
-        if not cookie_name or not urls:
+        url = data.get("url", "").strip()
+        numeric_id = data.get("numeric_id", "").strip()
+
+        if not cookie_name or not url or not numeric_id:
             return jsonify({"success": False, "error": "Нет данных"}), 400
-        if len(urls) > MAX_URLS:
-            return jsonify({"success": False, "error": f"Максимум {MAX_URLS} ссылок"}), 400
 
         cookies = load_cookies()
         cookie_str = cookies.get(cookie_name)
@@ -490,18 +484,10 @@ def propose_batch():
         if not cookie_dict:
             return jsonify({"success": False, "error": "Не разобрать куку"}), 400
 
-        results = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(process_single_url, url, cookie_dict, DELAY_BETWEEN): url for url in urls}
-            for future in as_completed(futures):
-                results.append(future.result())
-
-        url_order = {url: i for i, url in enumerate(urls)}
-        results.sort(key=lambda r: url_order.get(r["url"], 999))
-
-        return jsonify({"success": True, "results": results})
+        result = process_single_url(url, numeric_id, cookie_dict, 0)
+        return jsonify(result)
     except Exception as e:
-        logger.error(f"Ошибка propose_batch: {traceback.format_exc()}")
+        logger.error(f"Ошибка propose_single: {traceback.format_exc()}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.errorhandler(500)
