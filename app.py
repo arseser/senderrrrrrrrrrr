@@ -41,6 +41,34 @@ def save_cookies(data):
         raise
 
 def cookie_str_to_dict(cookie_str: str) -> dict:
+    """
+    Принимает строку кук в двух форматах:
+    1. Обычный: "key1=val1; key2=val2; ..."
+    2. JSON-массив: [{"name": "...", "value": "..."}, ...]
+    Возвращает словарь {name: value}
+    """
+    if not cookie_str:
+        return {}
+    # Проверяем, не JSON ли это
+    stripped = cookie_str.strip()
+    if stripped.startswith("[") or stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+            result = {}
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and "name" in item and "value" in item:
+                        result[item["name"]] = item["value"]
+                return result
+            elif isinstance(data, dict):
+                # На случай, если пришёл объект {"name": "val", ...}
+                if "name" in data and "value" in data:
+                    return {data["name"]: data["value"]}
+                # Или просто словарь ключ-значение
+                return data
+        except Exception:
+            pass  # Если JSON не парсится, идём дальше как со строкой
+    # Обычный формат "key=val; key=val"
     result = {}
     for item in cookie_str.split(";"):
         item = item.strip()
@@ -109,22 +137,22 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка загрузки страницы: {e}"}
 
-    # ========== НОВЫЙ СУПЕР-ПОИСК OFFER_ID (ГЛАВНОЕ ИСПРАВЛЕНИЕ) ==========
+    # ========== ПОИСК OFFER_ID ==========
     offer_id = None
 
-    # 1. Из URL: паттерны ...-ID-xxxxx.html или ...-id-xxxxx.html
+    # 1. Из URL: ...-ID-xxxxx.html
     match = re.search(r'/[^/]*[_-]id[_-](\w+)\.html', url, re.IGNORECASE)
     if match:
         offer_id = match.group(1)
     else:
-        # 2. Числовой ID в конце URL (например, /oferta/123456789)
+        # 2. Числовой ID в конце URL
         match = re.search(r'/(\d{7,})(?:\.html)?$', url)
         if match:
             offer_id = match.group(1)
 
-    # 3. Из og:url страницы
     if not offer_id:
         soup = BeautifulSoup(html, "html.parser")
+        # 3. Из og:url
         meta_og = soup.find("meta", property="og:url")
         if meta_og and meta_og.get("content"):
             og_url = meta_og.get("content", "")
@@ -136,55 +164,46 @@ def propose_price(url: str, cookie_str: str) -> dict:
                 if match:
                     offer_id = match.group(1)
 
-    # 4. Из data-cy="ad.id" (часто на новых страницах OLX)
-    if not offer_id:
-        elem = soup.find(attrs={"data-cy": "ad.id"})
-        if elem:
-            offer_id = elem.text.strip()
-            if not offer_id.isdigit():
-                # иногда id в data-cy="ad.id" внутри атрибута
-                offer_id = elem.get("data-testid") or elem.get("data-id")
-
-    # 5. Из <meta itemprop="productID" content="...">
-    if not offer_id:
-        meta_product = soup.find("meta", itemprop="productID")
-        if meta_product and meta_product.get("content"):
-            offer_id = meta_product["content"].strip()
-
-    # 6. Из скрытого input или любого тега с id="offer_id"
-    if not offer_id:
-        tag = soup.find(id="offer_id")
-        if tag and tag.get("value"):
-            offer_id = tag["value"]
-
-    # 7. Из data-offerid (атрибут на основном div'е)
-    if not offer_id:
-        elem = soup.find(attrs={"data-offerid": True})
-        if elem:
-            offer_id = elem["data-offerid"]
-
-    # 8. Попытка достать из JS: ad_id: 123456
-    if not offer_id:
-        match = re.search(r'"ad_id"\s*:\s*"?(\d+)"?', html)
-        if match:
-            offer_id = match.group(1)
-
-    # 9. Поиск в JSON внутри скрипта window.__INITIAL_STATE__
-    if not offer_id:
-        match = re.search(r'"adId"\s*:\s*"?(\d+)"?', html)
-        if match:
-            offer_id = match.group(1)
-
-    # 10. Просто любое число из 7+ цифр в og:url, если ничего не нашли (последняя надежда)
-    if not offer_id:
-        match = re.search(r'/(\d{7,})', url)
-        if match:
-            offer_id = match.group(1)
+        # 4. data-cy="ad.id"
+        if not offer_id:
+            elem = soup.find(attrs={"data-cy": "ad.id"})
+            if elem:
+                offer_id = elem.text.strip()
+        # 5. meta itemprop="productID"
+        if not offer_id:
+            meta_product = soup.find("meta", itemprop="productID")
+            if meta_product and meta_product.get("content"):
+                offer_id = meta_product["content"].strip()
+        # 6. input#offer_id
+        if not offer_id:
+            tag = soup.find(id="offer_id")
+            if tag and tag.get("value"):
+                offer_id = tag["value"]
+        # 7. data-offerid
+        if not offer_id:
+            elem = soup.find(attrs={"data-offerid": True})
+            if elem:
+                offer_id = elem["data-offerid"]
+        # 8. JS: ad_id: 123456
+        if not offer_id:
+            match = re.search(r'"ad_id"\s*:\s*"?(\d+)"?', html)
+            if match:
+                offer_id = match.group(1)
+        # 9. adId
+        if not offer_id:
+            match = re.search(r'"adId"\s*:\s*"?(\d+)"?', html)
+            if match:
+                offer_id = match.group(1)
+        # 10. Последняя надежда: любое число 7+ цифр в URL
+        if not offer_id:
+            match = re.search(r'/(\d{7,})', url)
+            if match:
+                offer_id = match.group(1)
 
     if not offer_id:
         return {"success": False, "error": "Не удалось извлечь ID объявления. Проверьте ссылку."}
 
-    # ========== ДАЛЕЕ КОД БЕЗ ИЗМЕНЕНИЙ ==========
+    # ========== ДАЛЕЕ БЕЗ ИЗМЕНЕНИЙ ==========
     original_price = extract_price(html)
     if original_price is None:
         return {"success": False, "error": "Не удалось определить цену на странице"}
@@ -227,7 +246,7 @@ def propose_price(url: str, cookie_str: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Ошибка отправки предложения: {e}"}
 
-# ========== HTML-страница прямо в коде ==========
+# ========== HTML-страница ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
