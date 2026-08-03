@@ -19,37 +19,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-COOKIES_FILE = "cookies.json"
+# Используем /tmp/ для надёжности (Клод сказал)
+COOKIES_FILE = "/tmp/cookies.json"
 MAX_URLS = 20
 MAX_WORKERS = 5
 DELAY_BETWEEN = 10
 
+# Создаём файл, если нет
 if not os.path.exists(COOKIES_FILE):
-    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
-        json.dump({}, f)
-    logger.info("Создан пустой cookies.json")
+    try:
+        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        logger.info(f"Создан пустой {COOKIES_FILE}")
+    except Exception as e:
+        logger.error(f"Не могу создать {COOKIES_FILE}: {e}")
 
 def load_cookies():
     try:
         with open(COOKIES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            logger.info(f"Загружено кук: {len(data)}")
+            return data
     except Exception as e:
-        logger.error(f"Ошибка загрузки cookies.json: {e}")
+        logger.error(f"Ошибка загрузки кук: {e}")
         return {}
 
 def save_cookies(data):
     try:
         with open(COOKIES_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info("Куки сохранены")
+        logger.info(f"Куки сохранены. Всего: {len(data)}")
     except Exception as e:
-        logger.error(f"Ошибка сохранения cookies.json: {e}")
+        logger.error(f"Ошибка сохранения кук: {e}")
         raise
 
 def cookie_str_to_dict(cookie_str: str) -> dict:
     if not cookie_str:
         return {}
     stripped = cookie_str.strip()
+    # Пробуем JSON
     if stripped.startswith("[") or stripped.startswith("{"):
         try:
             data = json.loads(stripped)
@@ -58,15 +66,20 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
                 for item in data:
                     if isinstance(item, dict) and "name" in item and "value" in item:
                         result[item["name"]] = item["value"]
-                return result
+                if result:
+                    return result
             elif isinstance(data, dict):
+                # Если это одиночный объект куки
                 if "name" in data and "value" in data:
                     return {data["name"]: data["value"]}
-                return data
+                # Если это плоский словарь ключ-значение
+                if all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+                    return data
         except Exception:
-            pass
+            logger.warning("Не удалось разобрать JSON кук, перехожу к формату key=value")
+    # Формат key=value; key2=value2
     result = {}
-    for item in cookie_str.split(";"):
+    for item in stripped.split(";"):
         item = item.strip()
         if "=" in item:
             k, v = item.split("=", 1)
@@ -76,6 +89,7 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
 def extract_numeric_id(html: str, url: str = "") -> str | None:
     soup = BeautifulSoup(html, "html.parser")
 
+    # Главный источник: olx-init-config (по рекомендации Клода)
     init_config = soup.find("script", id="olx-init-config")
     if init_config and init_config.string:
         try:
@@ -96,15 +110,16 @@ def extract_numeric_id(html: str, url: str = "") -> str | None:
                         val = None
                         break
                 if val and str(val).isdigit():
-                    logger.info(f"ID найден в olx-init-config (путь {path}): {val}")
+                    logger.info(f"ID найден в olx-init-config: {val}")
                     return str(val)
+            # Резервный regex
             config_str = json.dumps(config)
             match = re.search(r'"id"\s*:\s*(\d{7,})', config_str)
             if match:
-                logger.info(f"ID найден в olx-init-config через regex: {match.group(1)}")
+                logger.info(f"ID найден через regex в конфиге: {match.group(1)}")
                 return match.group(1)
         except Exception as e:
-            logger.warning(f"Не удалось распарсить olx-init-config: {e}")
+            logger.warning(f"Ошибка парсинга olx-init-config: {e}")
 
     meta = soup.find("meta", property="al:android:url")
     if meta and meta.get("content"):
@@ -296,7 +311,7 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
 
     return result
 
-# ========== ИСПРАВЛЕННЫЙ HTML С ГАРАНТИРОВАННОЙ РАБОТОЙ ДОБАВЛЕНИЯ КУК ==========
+# ========== ФРОНТЕНД С ГАРАНТИРОВАННОЙ РАБОТОЙ ДОБАВЛЕНИЯ КУК ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -341,7 +356,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <input type="text" id="cookieName" placeholder="Например: main">
         <label>Строка кук (из браузера):</label>
         <textarea id="cookieValue" rows="2" placeholder="Вставь JSON-массив или строку key=value; ..."></textarea>
-        <button onclick="addCookie()">Добавить</button>
+        <button id="addCookieBtn" onclick="addCookie()">Добавить</button>
         <span id="addStatus"></span>
     </div>
 
@@ -370,6 +385,7 @@ HTML_PAGE = """<!DOCTYPE html>
         async function loadCookies() {
             try {
                 const resp = await fetch('/api/cookies');
+                if (!resp.ok) throw new Error('Ошибка сервера');
                 const list = await resp.json();
                 const select = document.getElementById('cookieSelect');
                 select.innerHTML = '<option value="">-- Выберите куку --</option>';
@@ -389,6 +405,7 @@ HTML_PAGE = """<!DOCTYPE html>
             const nameInput = document.getElementById('cookieName');
             const valueInput = document.getElementById('cookieValue');
             const status = document.getElementById('addStatus');
+            const btn = document.getElementById('addCookieBtn');
             const name = nameInput.value.trim();
             const cookie = valueInput.value.trim();
 
@@ -396,6 +413,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 status.innerHTML = '<span class="error">Заполните оба поля</span>';
                 return;
             }
+
+            btn.disabled = true;
+            btn.textContent = 'Добавление...';
 
             try {
                 const resp = await fetch('/api/cookies', {
@@ -408,12 +428,15 @@ HTML_PAGE = """<!DOCTYPE html>
                     status.innerHTML = '<span class="success">Кука добавлена!</span>';
                     nameInput.value = '';
                     valueInput.value = '';
-                    loadCookies(); // обновляем список
+                    loadCookies(); // обновить список
                 } else {
-                    status.innerHTML = `<span class="error">Ошибка: ${data.error}</span>`;
+                    status.innerHTML = `<span class="error">Ошибка: ${data.error || 'Неизвестная ошибка'}</span>`;
                 }
             } catch (e) {
-                status.innerHTML = `<span class="error">Ошибка соединения: ${e}</span>`;
+                status.innerHTML = `<span class="error">Ошибка соединения: ${e.message}</span>`;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Добавить';
             }
         }
 
@@ -486,14 +509,14 @@ HTML_PAGE = """<!DOCTYPE html>
                     });
                 }
             } catch (e) {
-                modalResults.innerHTML = `<div class="result-card error">Ошибка соединения: ${e}</div>`;
+                modalResults.innerHTML = `<div class="result-card error">Ошибка соединения: ${e.message}</div>`;
             } finally {
                 sendBtn.disabled = false;
                 sendBtn.innerHTML = '🚀 Отправить все';
             }
         }
 
-        // Загружаем список кук при старте
+        // Первоначальная загрузка
         loadCookies();
     </script>
 </body>
@@ -515,6 +538,8 @@ def manage_cookies():
             return jsonify(list(cookies.keys()))
         if request.method == "POST":
             data = request.get_json(force=True)
+            if not data:
+                return jsonify({"success": False, "error": "Пустой запрос"}), 400
             name = data.get("name", "").strip()
             cookie_str = data.get("cookie", "").strip()
             if not name or not cookie_str:
@@ -522,12 +547,11 @@ def manage_cookies():
             cookies = load_cookies()
             cookies[name] = cookie_str
             save_cookies(cookies)
-            logger.info(f"Кука '{name}' добавлена/обновлена")
+            logger.info(f"Кука '{name}' добавлена/обновлена. Всего кук: {len(cookies)}")
             return jsonify({"success": True})
     except Exception as e:
-        err = traceback.format_exc()
-        logger.error(err)
-        return jsonify({"success": False, "error": f"Исключение: {err}"}), 500
+        logger.error(f"Ошибка в /api/cookies: {traceback.format_exc()}")
+        return jsonify({"success": False, "error": f"Исключение: {e}"}), 500
 
 @app.route("/api/propose_batch", methods=["POST"])
 def propose_batch():
@@ -544,8 +568,10 @@ def propose_batch():
         cookies = load_cookies()
         cookie_str = cookies.get(cookie_name)
         if not cookie_str:
-            return jsonify({"success": False, "error": "Кука не найдена"}), 404
+            return jsonify({"success": False, "error": f"Кука '{cookie_name}' не найдена"}), 404
         cookie_dict = cookie_str_to_dict(cookie_str)
+        if not cookie_dict:
+            return jsonify({"success": False, "error": "Не удалось разобрать куку"}), 400
         results = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(process_single_url, url, cookie_dict, DELAY_BETWEEN): url for url in urls}
@@ -555,9 +581,8 @@ def propose_batch():
         results.sort(key=lambda r: url_order.get(r["url"], 999))
         return jsonify({"success": True, "results": results})
     except Exception as e:
-        err = traceback.format_exc()
-        logger.error(err)
-        return jsonify({"success": False, "error": f"Исключение: {err}"}), 500
+        logger.error(f"Ошибка в /api/propose_batch: {traceback.format_exc()}")
+        return jsonify({"success": False, "error": f"Исключение: {e}"}), 500
 
 @app.errorhandler(500)
 def handle_500(e):
