@@ -74,8 +74,13 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
     return result
 
 def extract_numeric_id(html: str) -> str | None:
+    """
+    Извлекает числовой ID объявления.
+    Перебирает все известные источники, логирует каждый шаг.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
+    # 1. Мета-тег al:android:url (самый надёжный по рекомендации Клода)
     meta = soup.find("meta", property="al:android:url")
     if meta and meta.get("content"):
         match = re.search(r'item/(\d+)', meta["content"])
@@ -83,23 +88,69 @@ def extract_numeric_id(html: str) -> str | None:
             logger.info(f"ID найден в al:android:url: {match.group(1)}")
             return match.group(1)
 
+    # 2. Мета-тег og:url с -ID123456.html
     meta = soup.find("meta", property="og:url")
     if meta and meta.get("content"):
+        # Ищем -ID<число>.html или ID<число>.html
         match = re.search(r'-ID(\d+)\.html', meta["content"])
         if match:
             logger.info(f"ID найден в og:url: {match.group(1)}")
             return match.group(1)
 
+    # 3. Поиск в скриптах: __PRERENDERED_STATE__ или __INITIAL_STATE__
     for script in soup.find_all("script"):
         if script.string:
+            # adId (как число)
             match = re.search(r'"adId"\s*:\s*"?(\d+)"?', script.string)
             if match:
                 logger.info(f"ID найден в JS adId: {match.group(1)}")
                 return match.group(1)
+            # ad_id
+            match = re.search(r'"ad_id"\s*:\s*"?(\d+)"?', script.string)
+            if match:
+                logger.info(f"ID найден в JS ad_id: {match.group(1)}")
+                return match.group(1)
+            # "id": 12345678 (в контексте объявления)
             match = re.search(r'"id"\s*:\s*(\d{7,})', script.string)
             if match:
                 logger.info(f"ID найден в JS id: {match.group(1)}")
                 return match.group(1)
+
+    # 4. JSON-LD (structured data)
+    for script in soup.find_all("script", type="application/ld+json"):
+        if script.string:
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict):
+                    # Может быть "@id" или "productID"
+                    for key in ("@id", "productID", "sku"):
+                        if key in data and str(data[key]).isdigit():
+                            logger.info(f"ID найден в JSON-LD {key}: {data[key]}")
+                            return str(data[key])
+            except Exception:
+                pass
+
+    # 5. data-offerid на body или основном div
+    body = soup.find("body")
+    if body and body.get("data-offerid"):
+        val = body["data-offerid"]
+        if val.isdigit():
+            logger.info(f"ID найден в data-offerid: {val}")
+            return val
+
+    # 6. Скрытые поля input[name="offerId"] или подобные
+    for inp in soup.find_all("input", type="hidden"):
+        if inp.get("name") in ("offerId", "adId", "id") and inp.get("value", "").isdigit():
+            logger.info(f"ID найден в hidden input {inp['name']}: {inp['value']}")
+            return inp["value"]
+
+    # 7. Поиск в произвольных JS-объектах: offerId, adId, ad_id
+    # Уже покрыто выше, но добавим запасной regex по всему HTML
+    for pattern in (r'"adId"\s*:\s*"?(\d+)"?', r'"ad_id"\s*:\s*"?(\d+)"?', r'"offerId"\s*:\s*"?(\d+)"?'):
+        match = re.search(pattern, html)
+        if match:
+            logger.info(f"ID найден в HTML regex {pattern}: {match.group(1)}")
+            return match.group(1)
 
     return None
 
@@ -159,12 +210,13 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
         result["error"] = f"Ошибка загрузки: {e}"
         return result
 
-    # Извлекаем ID
+    # Извлекаем числовой ID
     numeric_id = extract_numeric_id(html)
     if not numeric_id:
         result["success"] = False
         result["error"] = "Не найден числовой ID"
         return result
+    logger.info(f"Числовой ID объявления: {numeric_id}")
 
     # Оригинальная цена
     original_price = extract_price(html)
@@ -182,7 +234,7 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
         proposal = original_price - 20
     proposal = max(proposal, 1)
 
-    # ЗАДЕРЖКА ПЕРЕД ОТПРАВКОЙ
+    # Задержка перед отправкой
     logger.info(f"Ожидание {delay} сек перед отправкой для {url}")
     time.sleep(delay)
 
@@ -219,7 +271,7 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
 
     return result
 
-# ========== HTML ==========
+# ========== HTML-страница ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -240,7 +292,6 @@ HTML_PAGE = """<!DOCTYPE html>
         .success { color: #27ae60; font-size: 13px; }
         .hint { font-size: 12px; color: #888; margin-top: 4px; }
 
-        /* Модальное окно */
         .modal-overlay {
             display: none;
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -306,7 +357,6 @@ HTML_PAGE = """<!DOCTYPE html>
         <button id="sendBtn" onclick="sendProposals()">🚀 Отправить все</button>
     </div>
 
-    <!-- Модальное окно -->
     <div class="modal-overlay" id="modalOverlay">
         <div class="modal">
             <h2>📋 Результаты отправки</h2>
