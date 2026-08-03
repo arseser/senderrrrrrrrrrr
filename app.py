@@ -109,11 +109,7 @@ def extract_price(html: str) -> int | None:
         return None
 
 def extract_bearer_token(cookie_dict: dict) -> str | None:
-    token = cookie_dict.get("access_token")
-    if token:
-        logger.info("Bearer токен из кук")
-        return token
-    return None
+    return cookie_dict.get("access_token")
 
 def extract_device_guid(cookie_dict: dict) -> str | None:
     return cookie_dict.get("deviceGUID")
@@ -168,63 +164,54 @@ def process_single_url(url: str, numeric_id: str, cookie_dict: dict, delay: int 
 
     device_guid = extract_device_guid(cookie_dict)
 
+    time.sleep(delay)
+
+    # GraphQL запрос (как сказал Клод)
+    graphql_url = "https://www.olx.pl/api/graphql"
+    graphql_payload = {
+        "query": "mutation MakeOffer($input: MakeOfferInput!) { makeOffer(input: $input) { id status chat { id } } }",
+        "variables": {
+            "input": {
+                "adId": int(numeric_id),
+                "price": int(proposal)
+            }
+        }
+    }
+
     api_headers = {
         "Authorization": f"Bearer {bearer_token}",
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-Platform": "web",
+        "Origin": "https://www.olx.pl",
+        "Referer": url,
     }
     if device_guid:
         api_headers["X-Device-Id"] = device_guid
 
-    time.sleep(delay)
-
-    # Шаг 1: Создать чат с первым сообщением
-    thread_url = "https://www.olx.pl/api/v1/chat/threads/"
-    thread_payload = {
-        "ad_id": int(numeric_id),
-        "text": f"Dzień dobry, proponuję cenę {proposal} zł."
-    }
-
     try:
-        thread_resp = session.post(thread_url, json=thread_payload, headers=api_headers, timeout=15)
-        logger.info(f"Создание чата: статус {thread_resp.status_code}, ответ: {thread_resp.text[:400]}")
-        if thread_resp.status_code not in (200, 201):
-            result["success"] = False
-            result["error"] = f"Ошибка создания чата: {thread_resp.status_code} - {thread_resp.text[:200]}"
-            return result
-        thread_data = thread_resp.json()
-        thread_id = thread_data.get("id") or (thread_data.get("data", {}) or {}).get("id")
-        if not thread_id:
-            result["success"] = False
-            result["error"] = f"Не получен ID чата. Ответ: {thread_resp.text[:300]}"
-            return result
-        logger.info(f"Чат создан: {thread_id}")
+        gql_resp = session.post(graphql_url, json=graphql_payload, headers=api_headers, timeout=15)
+        logger.info(f"GraphQL ответ: {gql_resp.status_code} - {gql_resp.text[:400]}")
+
+        if gql_resp.status_code == 200:
+            resp_data = gql_resp.json()
+            if "errors" in resp_data:
+                result["success"] = False
+                result["error"] = f"GraphQL ошибка: {resp_data['errors']}"
+                return result
+            offer_data = resp_data.get("data", {}).get("makeOffer", {})
+            if offer_data.get("id"):
+                result["success"] = True
+                result["original_price"] = original_price
+                result["proposed_price"] = proposal
+                return result
+
+        result["success"] = False
+        result["error"] = f"GraphQL: {gql_resp.status_code} - {gql_resp.text[:200]}"
     except Exception as e:
         result["success"] = False
-        result["error"] = f"Ошибка создания чата: {e}"
-        return result
-
-    # Шаг 2: Отправить price_proposal в чат
-    message_url = f"https://www.olx.pl/api/v1/chat/threads/{thread_id}/messages/"
-    message_payload = {
-        "type": "price_proposal",
-        "proposal_value": int(proposal),
-        "text": f"Proponuję cenę {proposal} zł."
-    }
-    try:
-        msg_resp = session.post(message_url, json=message_payload, headers=api_headers, timeout=15)
-        logger.info(f"Отправка предложения: статус {msg_resp.status_code}, ответ: {msg_resp.text[:300]}")
-        if msg_resp.status_code in (200, 201):
-            result["success"] = True
-            result["original_price"] = original_price
-            result["proposed_price"] = proposal
-        else:
-            result["success"] = False
-            result["error"] = f"Ошибка предложения: {msg_resp.status_code} - {msg_resp.text[:200]}"
-    except Exception as e:
-        result["success"] = False
-        result["error"] = f"Ошибка отправки предложения: {e}"
+        result["error"] = f"Ошибка GraphQL: {e}"
 
     return result
 
