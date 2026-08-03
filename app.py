@@ -30,9 +30,8 @@ MAX_WORKERS = 5
 DELAY_BETWEEN = 10
 
 def load_cookies():
-    """Загружает куки из Upstash Redis."""
     if not UPSTASH_URL:
-        logger.warning("Upstash URL не задан, куки не сохранятся.")
+        logger.warning("Upstash URL не задан")
         return {}
     try:
         resp = requests.get(f"{UPSTASH_URL}/get/{COOKIES_KEY}", headers=UPSTASH_HEADERS, timeout=10)
@@ -41,13 +40,12 @@ def load_cookies():
             return json.loads(result)
         return {}
     except Exception as e:
-        logger.error(f"Ошибка загрузки кук из Upstash: {e}")
+        logger.error(f"Ошибка загрузки кук: {e}")
         return {}
 
 def save_cookies(data):
-    """Сохраняет куки в Upstash Redis."""
     if not UPSTASH_URL:
-        logger.error("Upstash URL не задан, куки не сохранены.")
+        logger.error("Upstash URL не задан")
         return
     try:
         payload = json.dumps(data, ensure_ascii=False)
@@ -58,9 +56,9 @@ def save_cookies(data):
             timeout=10,
         )
         resp.raise_for_status()
-        logger.info(f"Куки сохранены в Upstash. Всего: {len(data)}")
+        logger.info(f"Куки сохранены. Всего: {len(data)}")
     except Exception as e:
-        logger.error(f"Ошибка сохранения кук в Upstash: {e}")
+        logger.error(f"Ошибка сохранения кук: {e}")
 
 def cookie_str_to_dict(cookie_str: str) -> dict:
     if not cookie_str:
@@ -93,7 +91,6 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
 
 def extract_numeric_id(html: str, url: str = "") -> str | None:
     soup = BeautifulSoup(html, "html.parser")
-
     init_config = soup.find("script", id="olx-init-config")
     if init_config and init_config.string:
         try:
@@ -103,8 +100,6 @@ def extract_numeric_id(html: str, url: str = "") -> str | None:
                 ["ad", "id"],
                 ["props", "pageProps", "ad", "id"],
                 ["data", "ad", "id"],
-                ["ad", "adId"],
-                ["adId"]
             ]:
                 val = config
                 for key in path:
@@ -119,7 +114,6 @@ def extract_numeric_id(html: str, url: str = "") -> str | None:
             config_str = json.dumps(config)
             match = re.search(r'"id"\s*:\s*(\d{7,})', config_str)
             if match:
-                logger.info(f"ID найден через regex в конфиге: {match.group(1)}")
                 return match.group(1)
         except Exception as e:
             logger.warning(f"Ошибка парсинга olx-init-config: {e}")
@@ -147,14 +141,6 @@ def extract_numeric_id(html: str, url: str = "") -> str | None:
                 match = re.search(pattern, script.string)
                 if match:
                     return match.group(1)
-
-    body = soup.find("body")
-    if body and body.get("data-offerid") and body["data-offerid"].isdigit():
-        return body["data-offerid"]
-
-    for inp in soup.find_all("input", type="hidden"):
-        if inp.get("name") in ("offerId", "adId", "id") and inp.get("value", "").isdigit():
-            return inp["value"]
 
     return None
 
@@ -297,7 +283,7 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
     message_payload = {
         "type": "price_proposal",
         "proposal_value": int(proposal),
-        "text": f"Proponuję cenę {proposal} zł."
+        "text": f"Proponuje cene {proposal} zl."
     }
     try:
         msg_resp = session.post(message_url, json=message_payload, timeout=15)
@@ -314,8 +300,9 @@ def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) 
 
     return result
 
-# ========== HTML ==========
-HTML_PAGE = """<!DOCTYPE html>
+# ========== ИСПРАВЛЕННЫЙ HTML (addEventListener, без inline onclick) ==========
+HTML_PAGE = r"""
+<!DOCTYPE html>
 <html lang="pl">
 <head>
     <meta charset="UTF-8">
@@ -359,7 +346,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <input type="text" id="cookieName" placeholder="Например: main">
         <label>Строка кук (из браузера):</label>
         <textarea id="cookieValue" rows="2" placeholder="Вставь JSON-массив или строку key=value; ..."></textarea>
-        <button id="addCookieBtn" onclick="addCookie()">Добавить</button>
+        <button id="addCookieBtn">Добавить</button>
         <span id="addStatus"></span>
     </div>
 
@@ -372,155 +359,164 @@ HTML_PAGE = """<!DOCTYPE html>
         <label>Ссылки на товары (до 20, по одной на строку):</label>
         <textarea id="offerUrls" rows="6" placeholder="https://www.olx.pl/d/oferta/...&#10;https://www.olx.pl/d/oferta/...&#10;..."></textarea>
         <div class="hint">Максимум 20 ссылок. Задержка 10 сек между отправками.</div>
-        <button id="sendBtn" onclick="sendProposals()">🚀 Отправить все</button>
+        <button id="sendBtn">🚀 Отправить все</button>
     </div>
 
     <div class="modal-overlay" id="modalOverlay">
         <div class="modal">
             <h2>📋 Результаты отправки</h2>
             <div class="modal-results" id="modalResults"></div>
-            <button class="modal-close" onclick="closeModal()">Закрыть</button>
+            <button class="modal-close" id="modalCloseBtn">Закрыть</button>
         </div>
     </div>
 
     <script>
-        async function loadCookies() {
-            try {
-                const resp = await fetch('/api/cookies');
-                if (!resp.ok) throw new Error('Ошибка сервера');
-                const list = await resp.json();
-                const select = document.getElementById('cookieSelect');
-                select.innerHTML = '<option value="">-- Выберите куку --</option>';
-                list.forEach(name => {
-                    const opt = document.createElement('option');
-                    opt.value = name;
-                    opt.textContent = name;
-                    select.appendChild(opt);
-                });
-            } catch (e) {
-                console.error('Ошибка загрузки кук:', e);
-            }
-        }
+        console.log("Скрипт загружен");
 
-        async function addCookie() {
-            const nameInput = document.getElementById('cookieName');
-            const valueInput = document.getElementById('cookieValue');
-            const status = document.getElementById('addStatus');
-            const btn = document.getElementById('addCookieBtn');
-            const name = nameInput.value.trim();
-            const cookie = valueInput.value.trim();
+        document.addEventListener("DOMContentLoaded", function() {
+            console.log("DOM готов, вешаем обработчики");
 
-            if (!name || !cookie) {
-                status.innerHTML = '<span class="error">Заполните оба поля</span>';
-                return;
-            }
+            // Добавление куки
+            document.getElementById("addCookieBtn").addEventListener("click", function() {
+                console.log("Клик по Добавить куку");
+                var nameInput = document.getElementById("cookieName");
+                var valueInput = document.getElementById("cookieValue");
+                var status = document.getElementById("addStatus");
+                var btn = document.getElementById("addCookieBtn");
+                var name = nameInput.value.trim();
+                var cookie = valueInput.value.trim();
 
-            btn.disabled = true;
-            btn.textContent = 'Добавление...';
-
-            try {
-                const resp = await fetch('/api/cookies', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ name, cookie })
-                });
-                const data = await resp.json();
-                if (data.success) {
-                    status.innerHTML = '<span class="success">Кука добавлена!</span>';
-                    nameInput.value = '';
-                    valueInput.value = '';
-                    loadCookies();
-                } else {
-                    status.innerHTML = `<span class="error">Ошибка: ${data.error || 'Неизвестная ошибка'}</span>`;
+                if (!name || !cookie) {
+                    status.innerHTML = '<span class="error">Заполните оба поля</span>';
+                    return;
                 }
-            } catch (e) {
-                status.innerHTML = `<span class="error">Ошибка соединения: ${e.message}</span>`;
-            } finally {
-                btn.disabled = false;
-                btn.textContent = 'Добавить';
-            }
-        }
 
-        function closeModal() {
-            document.getElementById('modalOverlay').classList.remove('active');
-        }
+                btn.disabled = true;
+                btn.textContent = "Добавление...";
 
-        async function sendProposals() {
-            const cookie_name = document.getElementById('cookieSelect').value;
-            const urlsText = document.getElementById('offerUrls').value.trim();
-            const sendBtn = document.getElementById('sendBtn');
-            const modalOverlay = document.getElementById('modalOverlay');
-            const modalResults = document.getElementById('modalResults');
-
-            if (!cookie_name || !urlsText) {
-                alert('Выберите куку и введите ссылки');
-                return;
-            }
-
-            const urls = urlsText.split('\n').map(u => u.trim()).filter(u => u.length > 0);
-            if (urls.length === 0) {
-                alert('Нет ссылок');
-                return;
-            }
-            if (urls.length > 20) {
-                alert('Максимум 20 ссылок');
-                return;
-            }
-
-            sendBtn.disabled = true;
-            sendBtn.innerHTML = '<span class="spinner"></span>Отправка...';
-
-            modalResults.innerHTML = urls.map((url, i) => 
-                `<div class="result-card" id="card-${i}">
-                    <div class="url">${url}</div>
-                    <div>⏳ Ожидание...</div>
-                </div>`
-            ).join('');
-            modalOverlay.classList.add('active');
-
-            try {
-                const resp = await fetch('/api/propose_batch', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ cookie_name, urls })
+                fetch("/api/cookies", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({ name: name, cookie: cookie })
+                })
+                .then(function(resp) { return resp.json(); })
+                .then(function(data) {
+                    if (data.success) {
+                        status.innerHTML = '<span class="success">Кука добавлена!</span>';
+                        nameInput.value = "";
+                        valueInput.value = "";
+                        loadCookies();
+                    } else {
+                        status.innerHTML = '<span class="error">Ошибка: ' + (data.error || "Неизвестная") + '</span>';
+                    }
+                })
+                .catch(function(e) {
+                    status.innerHTML = '<span class="error">Ошибка соединения: ' + e.message + '</span>';
+                })
+                .finally(function() {
+                    btn.disabled = false;
+                    btn.textContent = "Добавить";
                 });
-                const data = await resp.json();
+            });
 
-                if (data.results) {
-                    data.results.forEach((r, i) => {
-                        const card = document.getElementById(`card-${i}`);
-                        if (!card) return;
-                        if (r.success) {
-                            card.className = 'result-card success';
-                            card.innerHTML = `
-                                <div class="url">🔗 ${r.url}</div>
-                                <div>💰 Оригинальная цена: <span class="price">${r.original_price} zł</span></div>
-                                <div>📉 Предложено: <span class="price">${r.proposed_price} zł</span></div>
-                                <div>🆔 ID: ${r.numeric_id}</div>
-                                <div>✅ Успешно отправлено</div>
-                            `;
-                        } else {
-                            card.className = 'result-card error';
-                            card.innerHTML = `
-                                <div class="url">🔗 ${r.url}</div>
-                                <div>❌ ${r.error}</div>
-                                ${r.numeric_id ? `<div>🆔 Найденный ID: ${r.numeric_id}</div>` : ''}
-                            `;
-                        }
+            // Отправка предложений
+            document.getElementById("sendBtn").addEventListener("click", function() {
+                console.log("Клик по Отправить все");
+                var cookie_name = document.getElementById("cookieSelect").value;
+                var urlsText = document.getElementById("offerUrls").value.trim();
+                var sendBtn = document.getElementById("sendBtn");
+                var modalOverlay = document.getElementById("modalOverlay");
+                var modalResults = document.getElementById("modalResults");
+
+                if (!cookie_name || !urlsText) {
+                    alert("Выберите куку и введите ссылки");
+                    return;
+                }
+
+                var urls = urlsText.split("\n").map(function(u) { return u.trim(); }).filter(function(u) { return u.length > 0; });
+                if (urls.length === 0) {
+                    alert("Нет ссылок");
+                    return;
+                }
+                if (urls.length > 20) {
+                    alert("Максимум 20 ссылок");
+                    return;
+                }
+
+                sendBtn.disabled = true;
+                sendBtn.innerHTML = '<span class="spinner"></span>Отправка...';
+
+                modalResults.innerHTML = urls.map(function(url, i) {
+                    return '<div class="result-card" id="card-' + i + '"><div class="url">' + url + '</div><div>Ожидание...</div></div>';
+                }).join("");
+                modalOverlay.classList.add("active");
+
+                fetch("/api/propose_batch", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({ cookie_name: cookie_name, urls: urls })
+                })
+                .then(function(resp) { return resp.json(); })
+                .then(function(data) {
+                    if (data.results) {
+                        data.results.forEach(function(r, i) {
+                            var card = document.getElementById("card-" + i);
+                            if (!card) return;
+                            if (r.success) {
+                                card.className = "result-card success";
+                                card.innerHTML = '<div class="url">🔗 ' + r.url + '</div>' +
+                                    '<div>💰 Оригинальная цена: <span class="price">' + r.original_price + ' zł</span></div>' +
+                                    '<div>📉 Предложено: <span class="price">' + r.proposed_price + ' zł</span></div>' +
+                                    '<div>🆔 ID: ' + r.numeric_id + '</div>' +
+                                    '<div>✅ Успешно отправлено</div>';
+                            } else {
+                                card.className = "result-card error";
+                                card.innerHTML = '<div class="url">🔗 ' + r.url + '</div>' +
+                                    '<div>❌ ' + r.error + '</div>' +
+                                    (r.numeric_id ? '<div>🆔 Найденный ID: ' + r.numeric_id + '</div>' : "");
+                            }
+                        });
+                    }
+                })
+                .catch(function(e) {
+                    modalResults.innerHTML = '<div class="result-card error">Ошибка соединения: ' + e.message + '</div>';
+                })
+                .finally(function() {
+                    sendBtn.disabled = false;
+                    sendBtn.innerHTML = "🚀 Отправить все";
+                });
+            });
+
+            // Закрытие модального окна
+            document.getElementById("modalCloseBtn").addEventListener("click", function() {
+                document.getElementById("modalOverlay").classList.remove("active");
+            });
+
+            // Загрузка списка кук при старте
+            loadCookies();
+        });
+
+        function loadCookies() {
+            fetch("/api/cookies")
+                .then(function(resp) { return resp.json(); })
+                .then(function(list) {
+                    var select = document.getElementById("cookieSelect");
+                    select.innerHTML = '<option value="">-- Выберите куку --</option>';
+                    list.forEach(function(name) {
+                        var opt = document.createElement("option");
+                        opt.value = name;
+                        opt.textContent = name;
+                        select.appendChild(opt);
                     });
-                }
-            } catch (e) {
-                modalResults.innerHTML = `<div class="result-card error">Ошибка соединения: ${e.message}</div>`;
-            } finally {
-                sendBtn.disabled = false;
-                sendBtn.innerHTML = '🚀 Отправить все';
-            }
+                })
+                .catch(function(e) {
+                    console.error("Ошибка загрузки кук:", e);
+                });
         }
-
-        loadCookies();
     </script>
 </body>
-</html>"""
+</html>
+"""
 
 @app.route("/")
 def index():
@@ -547,11 +543,11 @@ def manage_cookies():
             cookies = load_cookies()
             cookies[name] = cookie_str
             save_cookies(cookies)
-            logger.info(f"Кука '{name}' добавлена/обновлена. Всего: {len(cookies)}")
+            logger.info(f"Кука '{name}' добавлена. Всего: {len(cookies)}")
             return jsonify({"success": True})
     except Exception as e:
         logger.error(f"Ошибка в /api/cookies: {traceback.format_exc()}")
-        return jsonify({"success": False, "error": f"Исключение: {e}"}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/propose_batch", methods=["POST"])
 def propose_batch():
@@ -587,12 +583,12 @@ def propose_batch():
         return jsonify({"success": True, "results": results})
     except Exception as e:
         logger.error(f"Ошибка в /api/propose_batch: {traceback.format_exc()}")
-        return jsonify({"success": False, "error": f"Исключение: {e}"}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.errorhandler(500)
 def handle_500(e):
     logger.error(f"Unhandled 500 error: {e}")
-    return jsonify({"success": False, "error": f"Unhandled: {traceback.format_exc()}"}), 500
+    return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
