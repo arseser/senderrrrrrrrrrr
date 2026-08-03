@@ -86,24 +86,17 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
 
 def extract_numeric_id(html: str, url: str = "") -> str | None:
     """
-    Три метода от Клода:
-    1. Из URL: -ID123aBc.html → оставляем только цифры
-    2. Из window.__INITIAL_STATE__
-    3. Прямой regex: "id":число,"title"
+    Приоритеты:
+    1. window.__INITIAL_STATE__
+    2. ID: число
+    3. "id":число,"title"
+    4. al:android:url
+    5. "id": 7+ цифр
+    6. Из URL (только если 7+ цифр после очистки)
     """
-    # 1. Из URL
-    if url:
-        match = re.search(r'-ID([a-zA-Z0-9]+)\.html', url)
-        if match:
-            raw_id = match.group(1)
-            numeric_id = re.sub(r'\D', '', raw_id)
-            if numeric_id and len(numeric_id) >= 7:
-                logger.info(f"ID из URL: {numeric_id}")
-                return numeric_id
-
     soup = BeautifulSoup(html, "html.parser")
 
-    # 2. window.__INITIAL_STATE__
+    # 1. __INITIAL_STATE__
     script_tag = soup.find("script", string=re.compile(r'window\.__INITIAL_STATE__'))
     if script_tag and script_tag.string:
         json_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', script_tag.string)
@@ -117,23 +110,45 @@ def extract_numeric_id(html: str, url: str = "") -> str | None:
             except Exception:
                 pass
 
-    # 3. Прямой regex по всему HTML: "id":число,"title"
+    # 2. ID: число
+    match = re.search(r'ID:\s*(\d{7,})', html)
+    if match:
+        logger.info(f"ID из ID: {match.group(1)}")
+        return match.group(1)
+
+    # 3. "id":число,"title"
     match = re.search(r'"id"\s*:\s*(\d+)\s*,\s*"title"', html)
     if match:
-        logger.info(f"ID через regex id+title: {match.group(1)}")
+        logger.info(f"ID из regex id+title: {match.group(1)}")
         return match.group(1)
 
-    # 4. Запасной: любой "id": 7+ цифр
-    match = re.search(r'"id"\s*:\s*(\d{7,})', html)
-    if match:
-        logger.info(f"ID через regex 7+ цифр: {match.group(1)}")
-        return match.group(1)
-
-    # 5. meta al:android:url
+    # 4. al:android:url
     meta = soup.find("meta", property="al:android:url")
     if meta and meta.get("content"):
         match = re.search(r'item/(\d+)', meta["content"])
         if match:
+            logger.info(f"ID из al:android:url: {match.group(1)}")
+            return match.group(1)
+
+    # 5. "id": 7+ цифр
+    match = re.search(r'"id"\s*:\s*(\d{7,})', html)
+    if match:
+        logger.info(f"ID из regex 7+ цифр: {match.group(1)}")
+        return match.group(1)
+
+    # 6. Из URL (только если получается 7+ цифр)
+    if url:
+        match = re.search(r'-ID([a-zA-Z0-9]+)\.html', url)
+        if match:
+            raw_id = match.group(1)
+            numeric_id = re.sub(r'\D', '', raw_id)
+            if numeric_id and len(numeric_id) >= 7:
+                logger.info(f"ID из URL: {numeric_id}")
+                return numeric_id
+        # Ещё вариант: /oferta/123456789
+        match = re.search(r'/(\d{7,})(?:\.html|$|\?)', url)
+        if match:
+            logger.info(f"ID из URL (число): {match.group(1)}")
             return match.group(1)
 
     return None
