@@ -2,10 +2,13 @@ import json
 import re
 import logging
 import os
+import time
 import traceback
+import urllib.parse
 from flask import Flask, request, jsonify
 import requests
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
@@ -17,6 +20,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 COOKIES_FILE = "cookies.json"
+MAX_URLS = 20
+MAX_WORKERS = 5
+DELAY_BETWEEN = 10  # секунд между отправками
 
 if not os.path.exists(COOKIES_FILE):
     with open(COOKIES_FILE, "w", encoding="utf-8") as f:
@@ -67,6 +73,36 @@ def cookie_str_to_dict(cookie_str: str) -> dict:
             result[k.strip()] = v.strip()
     return result
 
+def extract_numeric_id(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+
+    meta = soup.find("meta", property="al:android:url")
+    if meta and meta.get("content"):
+        match = re.search(r'item/(\d+)', meta["content"])
+        if match:
+            logger.info(f"ID найден в al:android:url: {match.group(1)}")
+            return match.group(1)
+
+    meta = soup.find("meta", property="og:url")
+    if meta and meta.get("content"):
+        match = re.search(r'-ID(\d+)\.html', meta["content"])
+        if match:
+            logger.info(f"ID найден в og:url: {match.group(1)}")
+            return match.group(1)
+
+    for script in soup.find_all("script"):
+        if script.string:
+            match = re.search(r'"adId"\s*:\s*"?(\d+)"?', script.string)
+            if match:
+                logger.info(f"ID найден в JS adId: {match.group(1)}")
+                return match.group(1)
+            match = re.search(r'"id"\s*:\s*(\d{7,})', script.string)
+            if match:
+                logger.info(f"ID найден в JS id: {match.group(1)}")
+                return match.group(1)
+
+    return None
+
 def extract_price(html: str) -> int | None:
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -91,134 +127,53 @@ def extract_price(html: str) -> int | None:
         logger.error(f"Ошибка парсинга цены: {e}")
         return None
 
-def extract_csrf(html: str, session_obj: requests.Session) -> str | None:
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        for meta_name in ("csrf-token", "_csrf", "csrf"):
-            meta = soup.find("meta", attrs={"name": meta_name})
-            if meta and meta.get("content"):
-                return meta["content"].strip()
-        meta = soup.find("meta", attrs={"property": "csrf-token"})
-        if meta and meta.get("content"):
-            return meta["content"].strip()
-        for inp in soup.find_all("input", type="hidden"):
-            if "csrf" in (inp.get("name") or "").lower() and inp.get("value"):
-                return inp["value"].strip()
-        for pat in (r'window\.CSRF_TOKEN\s*=\s*["\']([^"\']+)["\']',
-                    r'csrfToken\s*=\s*["\']([^"\']+)["\']',
-                    r'"_csrf"\s*:\s*"([^"]+)"'):
-            m = re.search(pat, html)
-            if m:
-                return m.group(1).strip()
-        for tag in soup.find_all(attrs={"data-csrf": True}):
-            return tag["data-csrf"].strip()
-        body = soup.find("body")
-        if body and body.get("data-csrf-token"):
-            return body["data-csrf-token"].strip()
-        for cname in ("csrftoken", "XSRF-TOKEN", "_csrf", "csrf"):
-            val = session_obj.cookies.get(cname)
-            if val:
-                return val
-        return None
-    except Exception as e:
-        logger.error(f"Ошибка извлечения CSRF: {e}")
-        return None
-
-def propose_price(url: str, cookie_str: str) -> dict:
-    if not cookie_str:
-        return {"success": False, "error": "Кука не задана"}
+def process_single_url(url: str, cookie_dict: dict, delay: int = DELAY_BETWEEN) -> dict:
+    """Обрабатывает одну ссылку с задержкой перед отправкой."""
+    result = {"url": url}
 
     session = requests.Session()
     try:
-        cookie_dict = cookie_str_to_dict(cookie_str)
         for k, v in cookie_dict.items():
-            session.cookies.set(k, v)
+            session.cookies.set(k, v, domain=".olx.pl")
     except Exception as e:
-        return {"success": False, "error": f"Ошибка обработки кук: {e}"}
+        result["success"] = False
+        result["error"] = f"Ошибка кук: {e}"
+        return result
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "pl-PL,pl;q=0.9",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": "https://www.olx.pl",
+        "Referer": url,
     }
+    session.headers.update(headers)
 
+    # Загружаем страницу
     try:
-        resp = session.get(url, headers=headers, timeout=15)
+        resp = session.get(url, timeout=15)
         resp.raise_for_status()
         html = resp.text
     except Exception as e:
-        return {"success": False, "error": f"Ошибка загрузки страницы: {e}"}
+        result["success"] = False
+        result["error"] = f"Ошибка загрузки: {e}"
+        return result
 
-    # ========== ПОИСК ЧИСЛОВОГО OFFER_ID (ОСНОВНОЕ ИСПРАВЛЕНИЕ) ==========
-    numeric_offer_id = None
-    soup = BeautifulSoup(html, "html.parser")
+    # Извлекаем ID
+    numeric_id = extract_numeric_id(html)
+    if not numeric_id:
+        result["success"] = False
+        result["error"] = "Не найден числовой ID"
+        return result
 
-    # 1. Ищем в JS-объектах adId / ad_id / adid как число
-    js_patterns = [
-        r'"adId"\s*:\s*"?(\d{7,})"?',
-        r'"ad_id"\s*:\s*"?(\d{7,})"?',
-        r'"adid"\s*:\s*"?(\d{7,})"?',
-        r"'adId'\s*:\s*'?(\d{7,})'?",
-        r'"id"\s*:\s*(\d{7,})',  # может быть в контексте объявления, но осторожно
-    ]
-    for pat in js_patterns:
-        m = re.search(pat, html)
-        if m:
-            numeric_offer_id = m.group(1)
-            logger.info(f"Найден числовой adId через JS: {numeric_offer_id}")
-            break
-
-    # 2. data-offerid (часто содержит число)
-    if not numeric_offer_id:
-        elem = soup.find(attrs={"data-offerid": True})
-        if elem:
-            raw = elem["data-offerid"]
-            if raw.isdigit():
-                numeric_offer_id = raw
-                logger.info(f"Найден data-offerid: {numeric_offer_id}")
-
-    # 3. meta[itemprop="productID"] (иногда число)
-    if not numeric_offer_id:
-        meta = soup.find("meta", itemprop="productID")
-        if meta and meta.get("content"):
-            raw = meta["content"].strip()
-            if raw.isdigit():
-                numeric_offer_id = raw
-                logger.info(f"Найден productID: {numeric_offer_id}")
-
-    # 4. Из og:url (может содержать числовой ID в конце)
-    if not numeric_offer_id:
-        meta_og = soup.find("meta", property="og:url")
-        if meta_og and meta_og.get("content"):
-            og_url = meta_og.get("content", "")
-            m = re.search(r'/(\d{7,})(?:\.html)?$', og_url)
-            if m:
-                numeric_offer_id = m.group(1)
-                logger.info(f"Найден числовой ID в og:url: {numeric_offer_id}")
-
-    # 5. Если ничего не нашли – фоллбэк на буквенный ID из URL (старый метод)
-    if not numeric_offer_id:
-        fallback_id = None
-        m = re.search(r'/[^/]*[_-][iI][dD](\w+)\.html', url)
-        if m:
-            fallback_id = m.group(1)
-        else:
-            m = re.search(r'/(\d{7,})(?:\.html)?$', url)
-            if m:
-                fallback_id = m.group(1)
-        if fallback_id:
-            logger.warning(f"Числовой ID не найден, используется буквенный: {fallback_id}")
-            numeric_offer_id = fallback_id
-        else:
-            return {"success": False, "error": "Не удалось извлечь ID объявления. Проверьте ссылку."}
-
-    logger.info(f"Итоговый offer_id для API: {numeric_offer_id}")
-
-    # ========== ЦЕНА И ПРЕДЛОЖЕНИЕ ==========
+    # Оригинальная цена
     original_price = extract_price(html)
     if original_price is None:
-        return {"success": False, "error": "Не удалось определить цену на странице"}
+        result["success"] = False
+        result["error"] = "Не удалось определить цену"
+        return result
 
+    # Вычисление предложения
     if original_price <= 300:
         proposal = original_price - 5
     elif original_price <= 1000:
@@ -227,52 +182,103 @@ def propose_price(url: str, cookie_str: str) -> dict:
         proposal = original_price - 20
     proposal = max(proposal, 1)
 
-    csrf_token = extract_csrf(html, session)
+    # ЗАДЕРЖКА ПЕРЕД ОТПРАВКОЙ
+    logger.info(f"Ожидание {delay} сек перед отправкой для {url}")
+    time.sleep(delay)
 
-    api_url = f"https://www.olx.pl/api/v1/offers/{numeric_offer_id}/propose-price/"
-    payload = {"price": str(proposal)}
-    api_headers = {
-        **headers,
-        "Content-Type": "application/json",
-        "Referer": url,
-        "Origin": "https://www.olx.pl",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    if csrf_token:
-        api_headers["X-CSRF-Token"] = csrf_token
+    # XSRF-TOKEN
+    xsrf_token = session.cookies.get("XSRF-TOKEN", domain=".olx.pl")
+    if xsrf_token:
+        xsrf_token = urllib.parse.unquote(xsrf_token)
+        session.headers.update({"X-XSRF-TOKEN": xsrf_token})
+
+    # Bearer token
+    access_token = cookie_dict.get("access_token")
+    if access_token:
+        session.headers.update({"Authorization": f"Bearer {access_token}"})
+
+    # Отправка предложения
+    api_url = f"https://www.olx.pl/api/v1/offers/{numeric_id}/propose-price/"
+    payload = {"price": int(proposal), "currency": "PLN"}
+    session.headers.update({"Content-Type": "application/json"})
 
     try:
-        api_resp = session.post(api_url, json=payload, headers=api_headers, timeout=15)
+        api_resp = session.post(api_url, json=payload, timeout=15)
         if api_resp.status_code == 200:
-            return {
-                "success": True,
-                "original_price": original_price,
-                "proposed_price": proposal,
-                "url": url
-            }
+            result["success"] = True
+            result["original_price"] = original_price
+            result["proposed_price"] = proposal
+            result["numeric_id"] = numeric_id
         else:
-            err_text = api_resp.text[:300]
-            logger.warning(f"API ответ {api_resp.status_code}: {err_text}")
-            return {"success": False, "error": f"Ошибка API (код {api_resp.status_code}): {err_text}"}
+            err_text = api_resp.text[:200]
+            result["success"] = False
+            result["error"] = f"API {api_resp.status_code}: {err_text}"
     except Exception as e:
-        return {"success": False, "error": f"Ошибка отправки предложения: {e}"}
+        result["success"] = False
+        result["error"] = f"Ошибка отправки: {e}"
 
-# ========== HTML-страница ==========
+    return result
+
+# ========== HTML ==========
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pl">
 <head>
     <meta charset="UTF-8">
     <title>ROCKET OLX Sender</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }
-        h1 { color: #2c3e50; }
-        label { display: block; margin-top: 10px; font-weight: bold; }
-        input[type="text"], textarea { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }
-        button { padding: 10px 20px; margin-top: 10px; background: #27ae60; color: white; border: none; cursor: pointer; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f5f5f5; }
+        h1 { color: #2c3e50; text-align: center; margin-bottom: 20px; }
+        label { display: block; margin-top: 10px; font-weight: bold; font-size: 14px; }
+        input[type="text"], textarea { width: 100%; padding: 10px; margin-top: 4px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+        textarea { resize: vertical; }
+        button { padding: 12px 24px; margin-top: 10px; background: #27ae60; color: white; border: none; cursor: pointer; border-radius: 6px; font-size: 14px; font-weight: bold; }
         button:hover { background: #219150; }
-        .box { border: 1px solid #ccc; padding: 15px; margin: 20px 0; border-radius: 6px; }
-        .error { color: red; }
-        .success { color: green; }
+        button:disabled { background: #95a5a6; cursor: not-allowed; }
+        .box { background: white; padding: 20px; margin: 20px 0; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .error { color: #e74c3c; font-size: 13px; }
+        .success { color: #27ae60; font-size: 13px; }
+        .hint { font-size: 12px; color: #888; margin-top: 4px; }
+
+        /* Модальное окно */
+        .modal-overlay {
+            display: none;
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.6); z-index: 1000;
+            justify-content: center; align-items: center;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal {
+            background: white; border-radius: 12px; padding: 30px;
+            width: 90%; max-width: 700px; max-height: 80vh;
+            display: flex; flex-direction: column;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+        .modal h2 { margin-bottom: 15px; color: #2c3e50; }
+        .modal-results {
+            overflow-y: auto; flex: 1; margin-bottom: 15px;
+            display: flex; flex-direction: column; gap: 10px;
+        }
+        .result-card {
+            border: 1px solid #ddd; border-radius: 8px; padding: 12px 15px;
+            font-size: 13px; line-height: 1.5;
+        }
+        .result-card.success { border-left: 4px solid #27ae60; background: #f0faf4; }
+        .result-card.error { border-left: 4px solid #e74c3c; background: #fef5f5; }
+        .result-card .url { font-size: 11px; color: #666; word-break: break-all; margin-bottom: 5px; }
+        .result-card .price { font-weight: bold; }
+        .modal-close {
+            padding: 10px 20px; background: #3498db; color: white; border: none;
+            border-radius: 6px; cursor: pointer; font-size: 14px; align-self: flex-end;
+        }
+        .modal-close:hover { background: #2980b9; }
+
+        .spinner {
+            display: inline-block; width: 16px; height: 16px; border: 3px solid #fff;
+            border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite;
+            margin-right: 8px; vertical-align: middle;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -283,21 +289,30 @@ HTML_PAGE = """<!DOCTYPE html>
         <label>Имя куки:</label>
         <input type="text" id="cookieName" placeholder="Например: main">
         <label>Строка кук (из браузера):</label>
-        <textarea id="cookieValue" rows="3" placeholder="sessionid=...; csrftoken=...;"></textarea>
+        <textarea id="cookieValue" rows="2" placeholder="Вставь JSON-массив или строку key=value; ..."></textarea>
         <button onclick="addCookie()">Добавить</button>
         <span id="addStatus"></span>
     </div>
 
     <div class="box">
-        <h3>Отправить предложение</h3>
+        <h3>Отправить предложения</h3>
         <label>Выбрать куку:</label>
         <select id="cookieSelect">
             <option value="">-- Загружаю список... --</option>
         </select>
-        <label>Ссылка на товар OLX:</label>
-        <input type="text" id="offerUrl" placeholder="https://www.olx.pl/d/oferta/...">
-        <button onclick="sendProposal()">Отправить предложение</button>
-        <pre id="resultBox"></pre>
+        <label>Ссылки на товары (до 20, по одной на строку):</label>
+        <textarea id="offerUrls" rows="6" placeholder="https://www.olx.pl/d/oferta/...&#10;https://www.olx.pl/d/oferta/...&#10;..."></textarea>
+        <div class="hint">Максимум 20 ссылок. Задержка 10 сек между отправками.</div>
+        <button id="sendBtn" onclick="sendProposals()">🚀 Отправить все</button>
+    </div>
+
+    <!-- Модальное окно -->
+    <div class="modal-overlay" id="modalOverlay">
+        <div class="modal">
+            <h2>📋 Результаты отправки</h2>
+            <div class="modal-results" id="modalResults"></div>
+            <button class="modal-close" onclick="closeModal()">Закрыть</button>
+        </div>
     </div>
 
     <script>
@@ -339,25 +354,78 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        async function sendProposal() {
+        function closeModal() {
+            document.getElementById('modalOverlay').classList.remove('active');
+        }
+
+        async function sendProposals() {
             const cookie_name = document.getElementById('cookieSelect').value;
-            const url = document.getElementById('offerUrl').value.trim();
-            const resultBox = document.getElementById('resultBox');
-            resultBox.textContent = '⏳ Отправка...';
-            if (!cookie_name || !url) {
-                resultBox.textContent = '❌ Выберите куку и укажите ссылку';
+            const urlsText = document.getElementById('offerUrls').value.trim();
+            const sendBtn = document.getElementById('sendBtn');
+            const modalOverlay = document.getElementById('modalOverlay');
+            const modalResults = document.getElementById('modalResults');
+
+            if (!cookie_name || !urlsText) {
+                alert('Выберите куку и введите ссылки');
                 return;
             }
-            const resp = await fetch('/api/propose', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ cookie_name, url })
-            });
-            const data = await resp.json();
-            if (data.success) {
-                resultBox.textContent = `✅ Предложение отправлено!\\nОригинальная цена: ${data.original_price} zł\\nПредложено: ${data.proposed_price} zł\\nСсылка: ${data.url}`;
-            } else {
-                resultBox.textContent = `❌ Ошибка: ${data.error}`;
+
+            const urls = urlsText.split('\\n').map(u => u.trim()).filter(u => u.length > 0);
+            if (urls.length === 0) {
+                alert('Нет ссылок');
+                return;
+            }
+            if (urls.length > 20) {
+                alert('Максимум 20 ссылок');
+                return;
+            }
+
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<span class="spinner"></span>Отправка...';
+
+            modalResults.innerHTML = urls.map((url, i) => 
+                `<div class="result-card" id="card-${i}">
+                    <div class="url">${url}</div>
+                    <div>⏳ Ожидание (задержка 10 сек)...</div>
+                </div>`
+            ).join('');
+            modalOverlay.classList.add('active');
+
+            try {
+                const resp = await fetch('/api/propose_batch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ cookie_name, urls })
+                });
+                const data = await resp.json();
+
+                if (data.results) {
+                    data.results.forEach((r, i) => {
+                        const card = document.getElementById(`card-${i}`);
+                        if (!card) return;
+                        if (r.success) {
+                            card.className = 'result-card success';
+                            card.innerHTML = `
+                                <div class="url">🔗 ${r.url}</div>
+                                <div>💰 Оригинальная цена: <span class="price">${r.original_price} zł</span></div>
+                                <div>📉 Предложено: <span class="price">${r.proposed_price} zł</span></div>
+                                <div>🆔 ID: ${r.numeric_id}</div>
+                                <div>✅ Успешно отправлено</div>
+                            `;
+                        } else {
+                            card.className = 'result-card error';
+                            card.innerHTML = `
+                                <div class="url">🔗 ${r.url}</div>
+                                <div>❌ ${r.error}</div>
+                            `;
+                        }
+                    });
+                }
+            } catch (e) {
+                modalResults.innerHTML = `<div class="result-card error">Ошибка соединения: ${e}</div>`;
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.innerHTML = '🚀 Отправить все';
             }
         }
     </script>
@@ -393,22 +461,38 @@ def manage_cookies():
         logger.error(err)
         return jsonify({"success": False, "error": f"Исключение: {err}"}), 500
 
-@app.route("/api/propose", methods=["POST"])
-def propose():
+@app.route("/api/propose_batch", methods=["POST"])
+def propose_batch():
     try:
         data = request.get_json(force=True)
-        url = data.get("url", "").strip()
         cookie_name = data.get("cookie_name", "").strip()
-        if not url or not cookie_name:
-            return jsonify({"success": False, "error": "URL и имя куки обязательны"}), 400
+        urls = data.get("urls", [])
+
+        if not cookie_name:
+            return jsonify({"success": False, "error": "Имя куки обязательно"}), 400
+        if not urls or len(urls) == 0:
+            return jsonify({"success": False, "error": "Нет ссылок"}), 400
+        if len(urls) > MAX_URLS:
+            return jsonify({"success": False, "error": f"Максимум {MAX_URLS} ссылок"}), 400
 
         cookies = load_cookies()
         cookie_str = cookies.get(cookie_name)
         if not cookie_str:
             return jsonify({"success": False, "error": "Кука не найдена"}), 404
 
-        result = propose_price(url, cookie_str)
-        return jsonify(result)
+        cookie_dict = cookie_str_to_dict(cookie_str)
+
+        results = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_single_url, url, cookie_dict, DELAY_BETWEEN): url for url in urls}
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        # Восстанавливаем порядок
+        url_order = {url: i for i, url in enumerate(urls)}
+        results.sort(key=lambda r: url_order.get(r["url"], 999))
+
+        return jsonify({"success": True, "results": results})
     except Exception as e:
         err = traceback.format_exc()
         logger.error(err)
